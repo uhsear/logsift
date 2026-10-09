@@ -26,6 +26,7 @@ chart.
     python logsift.py C:\\jobs\\parcels\\Logs
     python logsift.py --script C:\\jobs\\parcels\\nightly.py
     python logsift.py logs --format csv --out metrics.csv --apply
+    python logsift.py logs --tail --scheduled-at 03:00
     python logsift.py --self-test
 
 Data goes to stdout, every message goes to stderr, so a redirect gives a clean
@@ -36,6 +37,7 @@ no number in them survived the rules), 2 the write step failed, 64 usage error.
 from __future__ import print_function
 
 import argparse
+import codecs
 import csv
 import io
 import json
@@ -60,6 +62,48 @@ LOG_DIR_NAMES = ("Logs", "logs", "Log", "log")
 DEFAULT_DAYS_BACK = 30
 DEFAULT_MAX_FILES = 40
 DEFAULT_MAX_LINES = 5000
+
+# A log is sniffed from its first bytes, never assumed to be UTF-8. Windows
+# PowerShell 5.1 writes Out-File, ">" and ">>" as UTF-16LE with a BOM, and
+# Start-Transcript as UTF-8 with a BOM. Read as plain UTF-8, the first file is a
+# NUL between every letter and mines nothing. The second carries U+FEFF in front
+# of line one, so the preamble below no longer matches at position 0 and
+# "INFO - Records updated" becomes the key info_records_updated again.
+# Longest BOM first: the UTF-32LE BOM begins with the UTF-16LE one.
+BYTE_ORDER_MARKS = (
+    (codecs.BOM_UTF32_LE, "utf-32-le", 4),
+    (codecs.BOM_UTF32_BE, "utf-32-be", 4),
+    (codecs.BOM_UTF8, "utf-8", 1),
+    (codecs.BOM_UTF16_LE, "utf-16-le", 2),
+    (codecs.BOM_UTF16_BE, "utf-16-be", 2),
+)
+SNIFF_BYTES = 8192
+
+# --tail reads backwards in blocks of this size, so the last lines of a 2 GB
+# log cost a few blocks, not the whole file.
+TAIL_BLOCK_BYTES = 65536
+
+# --scheduled-at: a run whose first timestamp is further than this from every
+# scheduled time is a manual run. Python startup, an arcpy import and a queued
+# task all delay the first log line, so this is minutes, not seconds.
+DEFAULT_SLACK_MINUTES = 30
+
+# The first timestamp in a log is when the run started. Python logging writes
+# asctime as "2003-07-08 16:49:45,896", in local time, by default.
+START_STAMP_RE = re.compile(r"^\s*\[?\d{4}-\d{2}-\d{2}[ T](\d{2}):(\d{2}):\d{2}")
+
+# --sections: a banner line names the section the lines under it belong to.
+# "=== Roads ===", "### Parcels ###", "----- Step 2: Roads -----". The same
+# fence character, three or more times, on BOTH sides: a one sided
+# "--- retrying" is a message, not a banner. The optional preamble is spelled
+# out here, not borrowed from LOG_PREAMBLE_RE, because that one eats the first
+# "-" of a fence.
+SECTION_RE = re.compile(
+    r"^\s*(?:\[?\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:[.,]\d+)?\]?\s*(?:[-|:]\s+)?)?"
+    r"(?:\[?(?:DEBUG|INFO|WARNING|WARN|ERROR|CRITICAL)\]?\s*(?:[-|:]\s+)?)?"
+    r"(?P<fence>[=#*~-])(?P=fence){2,}\s*(?P<name>[^=#*~\s].*?)\s*(?P=fence){3,}\s*$"
+)
+SECTION_NAME_MAX = 40
 
 # Strip the logging preamble before mining a line. Without this the label
 # matcher sees the level word as part of the metric name: "... - INFO -
@@ -111,13 +155,18 @@ VERB_VALUE_RE = re.compile(
 # start_time and time are clocks. finished, failed and runtimeerror are words
 # that happened to sit beside a number. s_features and cpp come out of arcpy
 # and traceback text. A batch size is a setting the script echoed back, not
-# something it measured. The last pattern is a build or commit id.
+# something it measured. A key ending in a singular "version" names one
+# software version, and the Start-Transcript header writes nine of them
+# ("PSVersion: 5.1.26100", "BuildVersion: 10.0...") that would chart as 5.1 and
+# 10. A plural count such as reconciled_versions is kept. The last pattern is a
+# build or commit id.
 NOISE_METRIC_KEY_PATTERNS = [
     re.compile(pattern, re.IGNORECASE)
     for pattern in [
         r"^start_time$", r"^time$", r"^finished$", r"^failed$", r"^runtimeerror$",
         r"^cpp$", r"^s_features$", r"^pass_\d+_complete$",
         r"^.*batch_size$",
+        r"^.*version$", r"^pscompatibleversions$",
         r"^[a-f0-9_]{16,}$",
     ]
 ]
@@ -181,6 +230,93 @@ def parse_number(text):
         return float(clean)
     except ValueError:
         return None
+
+
+def sniff_encoding(sample):
+    """(codec, BOM length, code unit width) for a log's first bytes.
+
+    A BOM decides. Without one, ASCII text in UTF-16 has a zero in every other
+    byte, and the half that holds the zeros gives the byte order. Anything else
+    is UTF-8, read with replacement, as before.
+    """
+    for bom, codec, width in BYTE_ORDER_MARKS:
+        if sample.startswith(bom):
+            return codec, len(bom), width
+    pairs = len(sample) // 2
+    if pairs:
+        even = sample[0:pairs * 2:2].count(0)
+        odd = sample[1:pairs * 2:2].count(0)
+        # Zeros in both halves is a NUL padded file, not UTF-16.
+        if odd * 2 > pairs and even * 10 < pairs:
+            return "utf-16-le", 0, 2
+        if even * 2 > pairs and odd * 10 < pairs:
+            return "utf-16-be", 0, 2
+    return "utf-8", 0, 1
+
+
+def split_lines(text):
+    """Lines as universal newline mode reads them: CRLF, LF and CR each end one."""
+    return text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+
+
+def tail_lines(text, want, whole):
+    """The last `want` non-blank lines of text, or all of them when want is 0.
+
+    When the text does not begin at the start of the file, its first line is a
+    fragment of a longer one and is dropped: half a line can mine half a number.
+    """
+    lines = split_lines(text)
+    if not whole:
+        lines = lines[1:]
+    lines = [line for line in lines if line.strip()]
+    return lines[-want:] if want > 0 else lines
+
+
+def start_minutes(lines):
+    """Minutes after midnight of the first timestamp in these lines, or None.
+
+    Only the FIRST timestamp counts. A later one is a time the run reached, not
+    the time it started, so an impossible first stamp is None, not a reason to
+    look further down.
+    """
+    for line in lines:
+        match = START_STAMP_RE.match(line)
+        if match:
+            hour, minute = int(match.group(1)), int(match.group(2))
+            if hour < 24 and minute < 60:
+                return hour * 60 + minute
+            return None
+    return None
+
+
+def parse_clock(text):
+    """"03:14" as minutes after midnight. ValueError for anything else."""
+    match = re.match(r"^\s*(\d{1,2}):(\d{2})\s*$", str(text))
+    if not match or int(match.group(1)) > 23 or int(match.group(2)) > 59:
+        raise ValueError("%r is not a time of day as HH:MM" % (text,))
+    return int(match.group(1)) * 60 + int(match.group(2))
+
+
+def clock(minutes):
+    return "%02d:%02d" % divmod(minutes, 60)
+
+
+def minutes_off_schedule(started, scheduled):
+    """Minutes from a start time to the nearest scheduled time, round the clock.
+
+    Round the clock, because a task scheduled at 23:50 that starts at 00:05 is
+    15 minutes late, not 1425 minutes early.
+    """
+    gaps = [abs(started - at) % 1440 for at in scheduled]
+    return min(min(gap, 1440 - gap) for gap in gaps)
+
+
+def section_name(line):
+    """The section a banner line opens, as a key, or None if it is no banner."""
+    match = SECTION_RE.match(line)
+    if not match or not re.search(r"[A-Za-z]", match.group("name")):
+        return None
+    return normalize_metric_key(match.group("name")[:SECTION_NAME_MAX])
 
 
 def normalize_metric_key(label):
@@ -295,7 +431,10 @@ def mine_line(line, rules=()):
 
 
 def title_case_metric(metric_key):
-    return " ".join(part.capitalize() for part in str(metric_key).split("_") if part)
+    """updated_record_count reads Updated Record Count, and a sectioned key
+    roads.updated_record_count reads Roads / Updated Record Count."""
+    return " / ".join(" ".join(part.capitalize() for part in piece.split("_") if part)
+                      for piece in str(metric_key).split("."))
 
 
 def load_rules(text):
@@ -485,23 +624,58 @@ def recent_log_files(directories, days_back=DEFAULT_DAYS_BACK, limit=DEFAULT_MAX
     return [path for _, path in found[:limit]]
 
 
-def scan_log_file(path, max_lines=DEFAULT_MAX_LINES, rules=()):
+def _tail_of(handle, codec, start, width, want, block=TAIL_BLOCK_BYTES):
+    """The last `want` non-blank lines, read backwards from the end in blocks.
+
+    Every block boundary sits a whole number of code units after the BOM, so a
+    UTF-16 or UTF-32 file is never decoded from the middle of a character.
+    """
+    prev = handle.seek(0, 2)
+    data = b""
+    while True:
+        pos = max(start, prev - block)
+        pos -= (pos - start) % width
+        handle.seek(pos)
+        data = handle.read(prev - pos) + data
+        prev = pos
+        lines = tail_lines(data.decode(codec, "replace"), want, pos == start)
+        if pos == start or len(lines) >= want:
+            return lines
+
+
+def scan_log_file(path, max_lines=DEFAULT_MAX_LINES, rules=(), tail=False, sections=False,
+                  block=TAIL_BLOCK_BYTES):
     """The last value seen per metric in this file, plus line level counters.
 
     Last value wins within a file: a job that reports a running total reports
-    the final one last.
+    the final one last. With tail, max_lines counts back from the end of the
+    file instead of forward from its start. With sections, a key mined below a
+    banner line is prefixed with the banner's name. The start time is always
+    read from the head of the file, even with tail, because the tail of a long
+    run is hours after it started.
     """
     metrics = {}
     lines_scanned = error_lines = warning_lines = 0
 
     try:
-        handle = path.open("r", encoding="utf-8", errors="replace")
+        handle = path.open("rb")
     except OSError as exc:
         _emit("WARNING: could not read %s: %s" % (path, exc))
-        return {"metrics": {}, "lines_scanned": 0, "error_lines": 0, "warning_lines": 0}
+        return {"metrics": {}, "lines_scanned": 0, "error_lines": 0, "warning_lines": 0,
+                "started": None, "encoding": None}
 
     with handle:
-        for raw_line in handle:
+        sample = handle.read(SNIFF_BYTES)
+        codec, bom, width = sniff_encoding(sample)
+        started = start_minutes(split_lines(sample[bom:].decode(codec, "replace")))
+        if tail and max_lines > 0:
+            lines = _tail_of(handle, codec, bom, width, max_lines, block)
+        else:
+            handle.seek(bom)
+            lines = io.TextIOWrapper(handle, encoding=codec, errors="replace")
+
+        section = None
+        for raw_line in lines:
             line = raw_line.strip()
             if not line:
                 continue
@@ -513,21 +687,36 @@ def scan_log_file(path, max_lines=DEFAULT_MAX_LINES, rules=()):
             if "warning" in lower:
                 warning_lines += 1
 
-            for key, value in mine_line(line, rules):
-                metrics[key] = (value, line[:240])
+            # A banner is a title, not a measurement: it opens a section and is
+            # not mined itself.
+            banner = section_name(line) if sections else None
+            if banner is not None:
+                section = banner
+            else:
+                for key, value in mine_line(line, rules):
+                    if section is not None:
+                        key = section + "." + key
+                    metrics[key] = (value, line[:240])
 
             if 0 < max_lines <= lines_scanned:
                 break
 
     return {"metrics": metrics, "lines_scanned": lines_scanned,
-            "error_lines": error_lines, "warning_lines": warning_lines}
+            "error_lines": error_lines, "warning_lines": warning_lines,
+            "started": started, "encoding": codec}
 
 
-def build_rows(paths, rules=(), max_lines=DEFAULT_MAX_LINES):
+def build_rows(paths, rules=(), max_lines=DEFAULT_MAX_LINES, tail=False, sections=False,
+               scheduled=(), slack=DEFAULT_SLACK_MINUTES):
     """(metric rows, per file summaries) for these log files.
 
     One row per (file, metric). The file's modification time is the
     observation timestamp, because a scheduled job's log file is one run.
+
+    With scheduled times, a run that started more than slack minutes from
+    every one of them is a manual run: it is read and counted, and its rows are
+    left out of the series. A run with no timestamp at its start is kept with a
+    warning, because it cannot be told either way.
     """
     rows = []
     summaries = []
@@ -537,8 +726,18 @@ def build_rows(paths, rules=(), max_lines=DEFAULT_MAX_LINES):
             _emit("WARNING: %s vanished during the scan; skipping it" % path)
             continue
         observed = datetime.fromtimestamp(mtime, tz=timezone.utc).isoformat()
-        scan = scan_log_file(path, max_lines, rules)
-        for key in sorted(scan["metrics"]):
+        scan = scan_log_file(path, max_lines, rules, tail, sections)
+        manual = False
+        if scheduled and scan["started"] is None:
+            _emit("WARNING: %s has no timestamp at its start, so a manual run cannot be "
+                  "told from a scheduled one; kept" % path.name)
+        elif scheduled:
+            off = minutes_off_schedule(scan["started"], scheduled)
+            if off > slack:
+                manual = True
+                _emit("left out %s as a manual run: it started at %s, %d minute(s) from "
+                      "the nearest scheduled time" % (path.name, clock(scan["started"]), off))
+        for key in ([] if manual else sorted(scan["metrics"])):
             value, sample = scan["metrics"][key]
             rows.append({
                 "metric_key": key,
@@ -554,6 +753,7 @@ def build_rows(paths, rules=(), max_lines=DEFAULT_MAX_LINES):
             "error_lines": scan["error_lines"],
             "warning_lines": scan["warning_lines"],
             "metrics_found": len(scan["metrics"]),
+            "manual_run": manual,
         })
     rows.sort(key=lambda row: (row["metric_key"], row["observed_at_utc"], row["log_file"]))
     return rows, summaries
@@ -709,6 +909,15 @@ def self_test():
           "a batch size is a setting the job echoed, not a measurement")
     check(canonicalize_metric_key("a3f9c2b7e1d40852") is None,
           "a hex build id is not a metric")
+    transcript_header = ("PSVersion: 5.1.26100.9444", "BuildVersion: 10.0.26100.9444",
+                         "CLRVersion: 4.0.30319.42000", "WSManStackVersion: 3.0",
+                         "PSRemotingProtocolVersion: 2.3", "SerializationVersion: 1.1.0.1",
+                         "PSCompatibleVersions: 1.0, 2.0, 3.0, 4.0, 5.0, 5.1.26100.9444",
+                         "Process ID: 27252", "End time: 20261009073656")
+    check([line for line in transcript_header if mine_line(line)] == [],
+          "no line of a start-transcript header is a metric  <-- pinned defect")
+    check(mine_line("Reconciled versions: 12") == [("reconciled_versions", 12.0)],
+          "a plural count of versions is still a metric")
 
     # ---- the pinned defect: one canonical key cannot be mined twice from one line
     collide = "Duration: 0:00:07 Elapsed time: 0:01:00"
@@ -855,6 +1064,78 @@ def self_test():
     check(json.loads(render(sample, "json")) == sample, "the json round-trips every field")
     check(",1432," in body, "the csv carries 1432, not 1432.0")
 
+    # ---- encoding sniffing
+    text = "2026-08-11 03:14:07 - INFO - Records updated: 5\r\n"
+    check(sniff_encoding(text.encode("utf-8")) == ("utf-8", 0, 1),
+          "plain ascii is utf-8, as before")
+    check(sniff_encoding(codecs.BOM_UTF8 + text.encode("utf-8")) == ("utf-8", 3, 1),
+          "a utf-8 bom is found and skipped  <-- pinned defect")
+    check(sniff_encoding(codecs.BOM_UTF16_LE + text.encode("utf-16-le")) == ("utf-16-le", 2, 2),
+          "a utf-16le bom, as powershell 5.1 > and >> write, is found  <-- pinned defect")
+    check(sniff_encoding(codecs.BOM_UTF16_BE + text.encode("utf-16-be")) == ("utf-16-be", 2, 2),
+          "a utf-16be bom is found")
+    check(sniff_encoding(codecs.BOM_UTF32_LE + text.encode("utf-32-le")) == ("utf-32-le", 4, 4),
+          "a utf-32le bom is not mistaken for the utf-16le bom it starts with  <-- pinned defect")
+    check(sniff_encoding(codecs.BOM_UTF32_BE + text.encode("utf-32-be")) == ("utf-32-be", 4, 4),
+          "a utf-32be bom is found")
+    check(sniff_encoding(text.encode("utf-16-le")) == ("utf-16-le", 0, 2),
+          "utf-16le with no bom is told by its zero bytes")
+    check(sniff_encoding(text.encode("utf-16-be")) == ("utf-16-be", 0, 2),
+          "and utf-16be by which half of each pair holds them")
+    check(sniff_encoding(b"") == ("utf-8", 0, 1), "an empty file is utf-8")
+    check(sniff_encoding(b"\x00" * 64) == ("utf-8", 0, 1),
+          "a file padded with nuls is not utf-16: zeros in both halves")
+    check(sniff_encoding(b"Records updated: 5\n\xff\xfe not utf-8\n") == ("utf-8", 0, 1),
+          "ff fe in the middle of a file is not a bom")
+    check(sniff_encoding(b"x") == ("utf-8", 0, 1), "a one byte file is utf-8")
+
+    # ---- lines from the end
+    check(split_lines("a\r\nb\rc\nd") == ["a", "b", "c", "d"],
+          "crlf, cr and lf each end a line, as universal newlines read them")
+    check(tail_lines("a\n\nb\nc\n", 2, True) == ["b", "c"],
+          "the tail is the last n non-blank lines")
+    check(tail_lines("rds updated: 5\nb\nc", 5, False) == ["b", "c"],
+          "a window that starts mid file drops its first line as a fragment  <-- pinned defect")
+    check(tail_lines("a\nb", 5, True) == ["a", "b"],
+          "a window from the start of the file keeps its first line")
+    check(tail_lines("a\nb\nc", 0, True) == ["a", "b", "c"], "a tail of 0 is every line")
+
+    # ---- the start of a run
+    check(start_minutes(["2026-08-11 03:14:07,001 - INFO - start"]) == 194,
+          "the first timestamp is the start, 03:14 is minute 194")
+    check(start_minutes(["=====", "[2026-08-11 22:05:00] begin", "2026-08-11 23:59:00 x"]) == 1325,
+          "a banner before it is skipped, and only the first stamp counts")
+    check(start_minutes(["2026-08-11 25:14:07 bad", "2026-08-11 03:14:07 ok"]) is None,
+          "an impossible first stamp is unknown, not a later line's time")
+    check(start_minutes(["no stamp here", ""]) is None, "a log with no stamp has no start")
+    check(parse_clock("03:14") == 194 and parse_clock(" 3:14 ") == 194,
+          "a scheduled time is read as hh:mm")
+    raises(lambda: parse_clock("24:00"), "an hour past 23 is refused")
+    raises(lambda: parse_clock("12:60"), "a minute past 59 is refused")
+    raises(lambda: parse_clock("noon"), "a word is not a time")
+    check(clock(194) == "03:14", "minute 194 prints as 03:14")
+    check(minutes_off_schedule(parse_clock("00:05"), [parse_clock("23:50")]) == 15,
+          "a run 15 minutes past midnight is 15 minutes late, not 1425 early  <-- pinned defect")
+    check(minutes_off_schedule(parse_clock("14:10"), [parse_clock("03:00"), parse_clock("14:00")]) == 10,
+          "the nearest of several scheduled times is the one that counts")
+
+    # ---- section banners
+    check(section_name("=== Roads ===") == "roads", "a banner names its section")
+    check(section_name("### Parcels (pass 2) ###") == "parcels_pass_2",
+          "a section name becomes a key like any label")
+    check(section_name("2026-08-11 03:14:07 - INFO - ----- Step 2: Roads -----") == "step_2_roads",
+          "a banner behind a logging preamble is still a banner")
+    check(section_name("2026-08-11 03:14:07 --- Roads ---") == "roads",
+          "a dash fence behind a timestamp is not eaten as a separator  <-- pinned defect")
+    check(section_name("==========") is None, "a rule line with no name is not a banner")
+    check(section_name("=== 5 ===") is None, "a banner with no letter in it is not a section")
+    check(section_name("--- retrying") is None, "a one sided fence is a message, not a banner")
+    check(section_name("=== Roads ---") is None, "mismatched fences are not a banner")
+    check(section_name("Records updated: 5") is None, "an ordinary line is not a banner")
+    check(len(section_name("=== %s ===" % ("x" * 90))) == 40, "a long section name is cut at 40")
+    check(title_case_metric("roads.updated_record_count") == "Roads / Updated Record Count",
+          "a sectioned key gets a readable display name")
+
     # ---- the io layer, in a temporary directory
     tmp = tempfile.mkdtemp(prefix="logsift_selftest_")
     here = os.getcwd()
@@ -925,12 +1206,13 @@ def self_test():
         except OSError:
             pass
         folded = unique_directories([Path(case_root) / "Logs", Path(case_root) / "LOGS"])
-        if os.path.normcase("A") == "a":
-            check(len(folded) == 1,
-                  "Logs and LOGS are ONE directory where the filesystem folds case  <-- pinned defect")
-        else:
-            check(len(folded) == 2,
-                  "Logs and LOGS are TWO directories where it does not  <-- pinned defect")
+        # One assertion either way, written as expressions so that both hosts
+        # run the same line and report the same count.
+        folds = os.path.normcase("A") == "a"
+        check(len(folded) == (1 if folds else 2),
+              "Logs and LOGS are ONE directory where the filesystem folds case  <-- pinned defect"
+              if folds else
+              "Logs and LOGS are TWO directories where it does not  <-- pinned defect")
         check(len(unique_directories([Path(project), Path(project) / "." ,
                                       Path(project) / "Logs" / ".."])) == 1,
               "three spellings of one directory are scanned once")
@@ -1004,6 +1286,156 @@ def self_test():
         check(scan_log_file(Path(binary))["metrics"]["updated_record_count"][0] == 5.0,
               "bytes that are not valid utf-8 are replaced, not fatal")
 
+        # ---- the pinned defect: every encoding a windows job writes
+        def wbytes(name, data):
+            path = os.path.join(tmp, "enc", name)
+            parent = os.path.dirname(path)
+            if not os.path.isdir(parent):
+                os.makedirs(parent)
+            with open(path, "wb") as handle:
+                handle.write(data)
+            return Path(path)
+
+        run = ("2026-08-11 03:14:07 - INFO - Records updated: 1,432\r\n"
+               "2026-08-11 03:14:09 - INFO - Duration: 0:00:07\r\n")
+        want = {"updated_record_count": 1432.0, "duration_seconds": 7.0}
+        bom8 = scan_log_file(wbytes("bom8.log", codecs.BOM_UTF8 + run.encode("utf-8")))
+        check(dict((key, pair[0]) for key, pair in bom8["metrics"].items()) == want,
+              "a utf-8 bom log, as start-transcript writes, mines the same two metrics  <-- pinned defect")
+        check(not [key for key in bom8["metrics"] if key.startswith("info_")],
+              "and the bom does not bring back the info_ key on line one  <-- pinned defect")
+        for name, data in (("ps51.log", codecs.BOM_UTF16_LE + run.encode("utf-16-le")),
+                           ("be16.log", codecs.BOM_UTF16_BE + run.encode("utf-16-be")),
+                           ("le32.log", codecs.BOM_UTF32_LE + run.encode("utf-32-le")),
+                           ("be32.log", codecs.BOM_UTF32_BE + run.encode("utf-32-be")),
+                           ("nobom16.log", run.encode("utf-16-le"))):
+            got = scan_log_file(wbytes(name, data))
+            check(dict((key, pair[0]) for key, pair in got["metrics"].items()) == want
+                  and got["lines_scanned"] == 2,
+                  "%s (%s) mines the same two metrics from two lines  <-- pinned defect"
+                  % (name, got["encoding"]))
+        # Limits the README names. A BOM-less UTF-32 file, and a file whose
+        # encoding changes part way, as ">>" in PowerShell 5.1 makes when it
+        # appends UTF-16LE to a UTF-8 log, are decoded by their start.
+        check(scan_log_file(wbytes("nobom32.log", run.encode("utf-32-le")))["metrics"] == {},
+              "a utf-32 log with no bom mines nothing: a named limit")
+        mixed = scan_log_file(wbytes("mixed.log", b"Records updated: 3\r\n" * 10
+                                     + codecs.BOM_UTF16_LE + "Records checked: 9\r\n".encode("utf-16-le")))
+        check(list(mixed["metrics"]) == ["updated_record_count"],
+              "a utf-16 tail appended to a utf-8 log is not mined: a named limit")
+
+        # ---- tail read
+        check(scan_log_file(Path(running), max_lines=2, tail=True)["metrics"]["updated_record_count"][0]
+              == 30.0,
+              "--tail reads the last lines, so the final total is the one mined  <-- pinned defect")
+        check(scan_log_file(Path(running), max_lines=2, tail=True)["lines_scanned"] == 2,
+              "and still reads only --max-lines lines")
+        check(scan_log_file(Path(running), max_lines=0, tail=True)["lines_scanned"] == 3,
+              "--tail with --max-lines 0 reads the whole file")
+        check(scan_log_file(Path(running), max_lines=99, tail=True)["lines_scanned"] == 3,
+              "a tail longer than the file is the whole file")
+        long_text = "".join("2026-08-11 03:%02d:00 - INFO - Records updated: %d\n" % (i % 60, i)
+                            for i in range(1, 401))
+        longlog = wbytes("long.log", long_text.encode("utf-8"))
+        small = scan_log_file(longlog, max_lines=3, tail=True, block=64)
+        check(small["metrics"]["updated_record_count"][0] == 400.0 and small["lines_scanned"] == 3,
+              "a tail read in small blocks stops after a few blocks with the last value")
+        check(small["started"] == 181, "and the start time still comes from the head of the file")
+        long16 = wbytes("long16.log", codecs.BOM_UTF16_LE + long_text.encode("utf-16-le"))
+        for block in (61, 64, 4099):
+            got = scan_log_file(long16, max_lines=7, tail=True, block=block)
+            check(got["metrics"]["updated_record_count"][0] == 400.0 and got["lines_scanned"] == 7,
+                  "a utf-16 tail read in %d byte blocks stays on character boundaries  "
+                  "<-- pinned defect" % block)
+        # A misaligned block decodes as noise with no newline in it, so the read
+        # would quietly run back to the start of the file and still give the
+        # right answer. Only the lowest byte it sought to shows the difference.
+        class SeekSpy(io.BytesIO):
+            lowest = None
+
+            def seek(self, *args):
+                where = io.BytesIO.seek(self, *args)
+                self.lowest = where if self.lowest is None else min(self.lowest, where)
+                return where
+
+        data16 = codecs.BOM_UTF16_LE + long_text.encode("utf-16-le")
+        spy = SeekSpy(data16)
+        got = _tail_of(spy, "utf-16-le", 2, 2, 7, 61)
+        check(got[-1].endswith("Records updated: 400") and len(got) == 7
+              and spy.lowest > len(data16) - 61 * 12,
+              "a utf-16 tail stops after a few blocks, not at the start of the file  <-- pinned defect")
+        accents = "".join("Records updated: %d \xe9t\xe9\n" % i for i in range(1, 50))
+        accented_log = wbytes("accents.log", accents.encode("utf-8"))
+        cut = [scan_log_file(accented_log, max_lines=5, tail=True, block=block)
+               for block in range(20, 40)]
+        check(all(got["metrics"]["updated_record_count"] == (49.0, "Records updated: 49 \xe9t\xe9")
+                  and got["lines_scanned"] == 5 for got in cut),
+              "a block edge inside a two byte character never reaches a kept line")
+        check(scan_log_file(Path(noisy), max_lines=1, tail=True)["error_lines"] == 0,
+              "error lines are counted only inside the tail that was read")
+
+        # ---- sections
+        sectioned = write(os.path.join(tmp, "sections.log"),
+                          "2026-08-11 03:14:00 - INFO - Records checked: 70\n"
+                          "2026-08-11 03:14:01 - INFO - === Parcels ===\n"
+                          "2026-08-11 03:14:02 - INFO - Records updated: 10\n"
+                          "2026-08-11 03:14:03 - INFO - ===== Road Centerlines =====\n"
+                          "2026-08-11 03:14:04 - INFO - Records updated: 5\n")
+        flat = scan_log_file(Path(sectioned))
+        check(flat["metrics"]["updated_record_count"][0] == 5.0
+              and "parcels.updated_record_count" not in flat["metrics"],
+              "without --sections the second section overwrites the first, as before")
+        split = scan_log_file(Path(sectioned), sections=True)
+        check(split["metrics"]["parcels.updated_record_count"][0] == 10.0
+              and split["metrics"]["road_centerlines.updated_record_count"][0] == 5.0,
+              "with --sections each section is its own series  <-- pinned defect")
+        check(split["metrics"]["checked_record_count"][0] == 70.0,
+              "a metric above the first banner keeps its plain key")
+        check(len(split["metrics"]) == 3 and split["lines_scanned"] == 5,
+              "a banner line is counted but never mined")
+        titled = write(os.path.join(tmp, "titled.log"), "=== Updated 40 records ===\nRecords updated: 5\n")
+        check(scan_log_file(Path(titled), sections=True)["metrics"]
+              == {"updated_40_records.updated_record_count": (5.0, "Records updated: 5")},
+              "a number inside a banner names the section and is not mined as a metric")
+        trailing = write(os.path.join(tmp, "trailing.log"),
+                         "=== Roads ===\nRecords updated: 5\nDuration: 0:00:09\n")
+        check(list(scan_log_file(Path(trailing), sections=True)["metrics"])
+              == ["roads.updated_record_count", "roads.duration_seconds"],
+              "a job total after the last banner is keyed to that section: a named limit")
+        rows, _ = build_rows([Path(sectioned)], sections=True)
+        check([row["display_name"] for row in rows][1] == "Parcels / Updated Record Count",
+              "a sectioned row carries a readable display name")
+
+        # ---- manual runs
+        manual_log = write(os.path.join(tmp, "manual", "run_1042.log"),
+                           "2026-08-11 10:42:00 - INFO - Records updated: 3\n")
+        late_log = write(os.path.join(tmp, "manual", "run_0320.log"),
+                         "2026-08-11 03:20:00 - INFO - Records updated: 1400\n")
+        bare_log = write(os.path.join(tmp, "manual", "run_bare.log"), "Records updated: 9\n")
+        at = [parse_clock("03:14")]
+        (rows, summaries), _, warned = capture(
+            lambda: build_rows([Path(manual_log), Path(late_log)], scheduled=at))
+        check([row["metric_value"] for row in rows] == [1400.0],
+              "a run at 10:42 for a job scheduled at 03:14 is left out of the series  <-- pinned defect")
+        check([summary["manual_run"] for summary in summaries] == [True, False],
+              "and is still counted as a file that was read")
+        check("left out run_1042.log" in warned and "10:42" in warned and "448 minute" in warned,
+              "and stderr says which run, when it started and how far off it was")
+        rows, _ = build_rows([Path(manual_log), Path(late_log)])
+        check(len(rows) == 2, "without --scheduled-at no run is left out, as before")
+        rows, _ = build_rows([Path(manual_log)], scheduled=at, slack=500)
+        check(len(rows) == 1, "a slack wide enough to reach the run keeps it")
+        (rows, _), _, warned = capture(lambda: build_rows([Path(bare_log)], scheduled=at))
+        check(len(rows) == 1 and "no timestamp at its start" in warned,
+              "a run with no timestamp is kept, with a warning that it could not be told")
+        slow = write(os.path.join(tmp, "slow", "run.log"),
+                     "2026-08-11 03:14:00 - INFO - start\n"
+                     + "2026-08-11 04:00:00 - INFO - working\n" * 40
+                     + "2026-08-11 05:30:00 - INFO - Records updated: 77\n")
+        rows, _ = build_rows([Path(slow)], max_lines=2, tail=True, scheduled=at)
+        check([row["metric_value"] for row in rows] == [77.0],
+              "a long run read with --tail is judged by its first line, not its last  <-- pinned defect")
+
         # ---- rows
         rows, summaries = build_rows([logdir / "nightly_0811.log"])
         check(len(rows) == 2 and rows[0]["metric_key"] == "duration_seconds",
@@ -1058,6 +1490,24 @@ def self_test():
         except SystemExit as exc:
             code = exc.code
         check(code == 2, "a unique prefix of --apply is refused, not read as --apply  <-- pinned defect")
+        args = _parse([])
+        check(args.tail is False and args.sections is False and args.scheduled_at is None
+              and args.slack == 30,
+              "--tail, --sections and --scheduled-at are off by default, and slack is 30 minutes")
+        args = _parse(["x", "--tail", "--sections", "--scheduled-at", "03:14",
+                       "--scheduled-at", "23:50", "--slack", "5"])
+        check(args.tail is True and args.sections is True and args.scheduled_at == [194, 1430]
+              and args.slack == 5,
+              "every new flag is read, and --scheduled-at repeats")
+        for bad_argv, label in ((["--scheduled-at", "25:00"], "an impossible --scheduled-at"),
+                                (["--sched", "03:14"], "a prefix of --scheduled-at"),
+                                (["--tai"], "a prefix of --tail")):
+            try:
+                code = None
+                _, _, err = capture(lambda: _parse(bad_argv))
+            except SystemExit as exc:
+                code = exc.code
+            check(code == 2, "%s is a usage error" % label)
 
         # ---- main, end to end
         rc, out, err = capture(lambda: main([]))
@@ -1144,6 +1594,32 @@ def self_test():
         check("updated_record_count" not in out,
               "and a rule mapped to null drops one the built-in rules would keep")
 
+        # ---- the new modes, end to end
+        rc, out, err = capture(lambda: main([str(logdir), "--tail", "--sections"]))
+        check(rc == 64 and "cannot be combined" in err and out == "",
+              "--tail with --sections is a usage error, not a silently wrong key")
+        rc, out, err = capture(lambda: main([str(logdir), "--slack", "-1"]))
+        check(rc == 64 and "--slack" in err, "a negative --slack is a usage error")
+        rc, out, err = capture(lambda: main([os.path.join(tmp, "enc", "ps51.log"), "--format", "csv"]))
+        check(rc == 0 and "updated_record_count,Updated Record Count,1432," in out,
+              "a powershell 5.1 utf-16 log mines through main  <-- pinned defect")
+        rc, out, err = capture(lambda: main([str(longlog), "--tail", "--max-lines", "1"]))
+        check(rc == 0 and " 400 " in out, "--tail through main mines the final value")
+        rc, out, err = capture(lambda: main([sectioned, "--sections"]))
+        check(rc == 0 and "parcels.updated_record_count" in out
+              and "road_centerlines.updated_record_count" in out,
+              "--sections through main charts two series")
+        rc, out, err = capture(lambda: main([os.path.dirname(manual_log), "--days", "36500",
+                                             "--scheduled-at", "03:14"]))
+        check(rc == 0 and "1400" in out and " 3 " not in out
+              and "1 manual run(s) left out" in err,
+              "--scheduled-at through main leaves the manual run out and counts it")
+        rc, out, err = capture(lambda: main([manual_log, "--scheduled-at", "03:14"]))
+        check(rc == 1 and "no number" in err,
+              "a series of only manual runs is exit 1, not an empty success")
+        rc, out, err = capture(lambda: main([str(logdir)]))
+        check("manual run" not in err, "and without --scheduled-at stderr is as before")
+
         # ---- the pinned defect: nothing is written without --apply
         target = os.path.join(tmp, "metrics.csv")
         rc, dry_out, err = capture(lambda: main([str(logdir), "--format", "csv", "--out", target]))
@@ -1192,6 +1668,8 @@ def self_test():
         # mechanism it is testing makes it worthless: a check() that recorded a
         # failure as a pass would report this very assertion as a pass too, and
         # the run would end green with every defect above unreported.
+        # ponytail: the next four lines run only when check() itself is broken,
+        # so a green run cannot reach them. Coverage reports them as missed.
         if len(probe) != 3 or probe_passed != 0:
             sys.stdout.write(
                 "FATAL  check() and raises() did not record three deliberate "
@@ -1204,19 +1682,31 @@ def self_test():
         os.chdir(here)
         shutil.rmtree(tmp, ignore_errors=True)
     check(not os.path.isdir(tmp), "the self-test leaves no temporary directory behind")
+    check(footer(5, ["x"]) == ["5 assertions, 1 failed", "  FAILED: x"],
+          "a failed run's footer names the count and each failure")
 
     print("-" * 68)
-    total = passed[0] + len(failed)
+    for line in footer(passed[0] + len(failed), failed):
+        print(line)
+    return 1 if failed else 0
+
+
+def footer(total, failed):
+    """The self-test's last lines. A function so the failure branch is tested."""
     if failed:
-        print("%d assertions, %d failed" % (total, len(failed)))
-        for label in failed:
-            print("  FAILED: %s" % label)
-        return 1
-    print("%d assertions, 0 failed" % total)
-    return 0
+        return ["%d assertions, %d failed" % (total, len(failed))] + [
+            "  FAILED: %s" % label for label in failed]
+    return ["%d assertions, 0 failed" % total]
 
 
 # ----------------------------------------------------------------------- cli
+
+def _clock_arg(text):
+    try:
+        return parse_clock(text)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc))
+
 
 def _parse(argv):
     parser = argparse.ArgumentParser(
@@ -1244,6 +1734,21 @@ def _parse(argv):
     parser.add_argument("--max-lines", dest="max_lines", type=int,
                         default=DEFAULT_MAX_LINES, metavar="N",
                         help="at most N lines per file, 0 for no limit (default 5000)")
+    parser.add_argument("--tail", action="store_true",
+                        help="take --max-lines from the END of each file, where a job "
+                             "writes its totals, instead of from the start")
+    parser.add_argument("--sections", action="store_true",
+                        help="prefix each key with the banner section it sits under, "
+                             "such as === Roads ===, so two sections are two series")
+    parser.add_argument("--scheduled-at", dest="scheduled_at", action="append",
+                        type=_clock_arg, metavar="HH:MM",
+                        help="a time the job is scheduled to start, in the clock its "
+                             "log is written in. Repeat it for several. A run that "
+                             "started further than --slack from all of them is a "
+                             "manual run and is left out of the series.")
+    parser.add_argument("--slack", type=int, default=DEFAULT_SLACK_MINUTES, metavar="N",
+                        help="minutes a scheduled run may start late or early "
+                             "(default 30)")
     parser.add_argument("--rules", metavar="FILE",
                         help="a JSON object of {\"pattern\": \"canonical_key\"}. "
                              "Checked before the built-in rules. null drops the label.")
@@ -1263,6 +1768,16 @@ def main(argv=None):
 
     if args.self_test:
         return self_test()
+
+    if args.slack < 0:
+        _emit("error: --slack is a number of minutes, 0 or more")
+        return 64
+    # A tail window starts part way through a section, so the lines above its
+    # first banner would be keyed to no section and join the wrong series.
+    if args.tail and args.sections:
+        _emit("error: --tail and --sections cannot be combined: the lines above the "
+              "first banner in the tail would be keyed to no section")
+        return 64
 
     rules = []
     if args.rules:
@@ -1303,7 +1818,8 @@ def main(argv=None):
               % (args.days, ", ".join(str(directory) for directory in directories)))
         return 1
 
-    rows, summaries = build_rows(files, rules, args.max_lines)
+    rows, summaries = build_rows(files, rules, args.max_lines, args.tail, args.sections,
+                                 args.scheduled_at or (), args.slack)
     text = render(rows, args.format)
 
     written = 0
@@ -1322,6 +1838,9 @@ def main(argv=None):
              sum(summary["lines_scanned"] for summary in summaries),
              len(rows),
              sum(summary["error_lines"] for summary in summaries)))
+    if args.scheduled_at:
+        _emit("logsift: %d manual run(s) left out of the series"
+              % sum(1 for summary in summaries if summary["manual_run"]))
     if not rows:
         _emit("no number in those logs survived the rules. Run with --rules to "
               "name the labels this job uses.")
@@ -1329,5 +1848,7 @@ def main(argv=None):
     return 0
 
 
+# ponytail: run as a script this test is always true, so coverage reports its
+# false branch, the import case, as missed.
 if __name__ == "__main__":
     sys.exit(main())
