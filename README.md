@@ -62,6 +62,9 @@ PASS  the real duration survives the whole pipeline  <-- pinned defect
 PASS  and the start time never enters the file
 PASS  and it is not counted as a log file that was read  <-- pinned defect
 PASS  --apply is OFF by default  <-- pinned defect
+...
+PASS  a unique prefix of --apply is refused, not read as --apply  <-- pinned defect
+...
 PASS  one bad path among good ones fails the whole run  <-- pinned defect
 PASS  stdout carries ONLY the data, so a redirect gives a clean csv  <-- pinned defect
 PASS  --out without --apply writes NOTHING  <-- pinned defect
@@ -72,14 +75,14 @@ PASS  a write that fails is exit 2, not a false success
 PASS  check() and raises() really do record a failure  <-- pinned defect
 PASS  the self-test leaves no temporary directory behind
 --------------------------------------------------------------------
-196 assertions, 0 failed
+197 assertions, 0 failed
 ```
 
 ## Requirements
 
 Python 3.9 or newer. Nothing to install, no `arcpy`, no third-party package, no network and no
 database. It runs on ArcGIS Pro's Python and on a plain `python3` equally. The self-test above
-runs 196 assertions on Windows and the same 196 on Linux.
+runs 197 assertions on Windows. The Linux count was not re-run after this change.
 
 ```
 git clone https://github.com/uhsear/logsift.git

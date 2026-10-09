@@ -1052,6 +1052,12 @@ def self_test():
         except SystemExit as exc:
             code = exc.code
         check(code == 2, "an unknown format is a usage error, not a crash")
+        try:
+            code = None
+            _, _, _ = capture(lambda: _parse(["--ap"]))
+        except SystemExit as exc:
+            code = exc.code
+        check(code == 2, "a unique prefix of --apply is refused, not read as --apply  <-- pinned defect")
 
         # ---- main, end to end
         rc, out, err = capture(lambda: main([]))
@@ -1215,6 +1221,7 @@ def self_test():
 def _parse(argv):
     parser = argparse.ArgumentParser(
         prog="logsift.py",
+        allow_abbrev=False,
         description="Mine a job's own log files into a metric series, and "
                     "refuse the number that is really a timestamp.",
         epilog="Data goes to stdout and messages go to stderr. Nothing is "
