@@ -4,7 +4,7 @@
 The charts were flat at zero for a month and nobody noticed, because they were
 not empty. They were confidently wrong. The line was:
 
-    2026-08-11 03:14:07 - INFO - Duration: 0:00:07
+    2026-03-04 03:14:07 - INFO - Duration: 0:00:07
 
 A label-and-number matcher reads the log level as part of the metric name and
 mines info_duration = 0.0 from the leading zero of the clock. The real value,
@@ -29,9 +29,10 @@ chart.
     python logsift.py logs --tail --scheduled-at 03:00
     python logsift.py --self-test
 
-Data goes to stdout, every message goes to stderr, so a redirect gives a clean
-file. Exit codes: 0 metrics mined, 1 nothing to chart (no recent log file, or
-no number in them survived the rules), 2 the write step failed, 64 usage error.
+Data goes to stdout as UTF-8, every message goes to stderr, so a redirect gives
+a clean file. Exit codes: 0 metrics mined, 1 nothing to chart (no recent log
+file, or no number in them survived the rules), 2 the write step failed, 3 a log
+file could not be read, 64 usage error.
 """
 
 from __future__ import print_function
@@ -104,6 +105,10 @@ SECTION_RE = re.compile(
     r"(?P<fence>[=#*~-])(?P=fence){2,}\s*(?P<name>[^=#*~\s].*?)\s*(?P=fence){3,}\s*$"
 )
 SECTION_NAME_MAX = 40
+# A banner is short. The pattern above backtracks quadratically on a long line
+# of spaces after a fence (a 20 KB line took 4 seconds), so a longer line is
+# never tried: its title is cut at SECTION_NAME_MAX anyway.
+SECTION_LINE_MAX = 1000
 
 # Strip the logging preamble before mining a line. Without this the label
 # matcher sees the level word as part of the metric name: "... - INFO -
@@ -116,17 +121,26 @@ SECTION_NAME_MAX = 40
 # timestamp: "ts - LEVEL -", "ts | LEVEL |", "ts LEVEL -", "[ts]", "ts",
 # "LEVEL -" and "LEVEL:". Every part is optional, so an ordinary line matches
 # the empty string at position 0 and keeps all of its text.
+#
+# A level word is stripped only when it is plainly a level: in brackets, before
+# a separator, or after a timestamp. A bare "ERROR COUNT: 3" or "WARNING count:
+# 2" is a label, and stripping its first word would leave the key "count" and
+# merge two unrelated metrics. "ERRORS: 4" is not the level "ERROR" either.
+_LEVELS = r"(?:DEBUG|INFO|WARNING|WARN|ERROR|CRITICAL)"
 LOG_PREAMBLE_RE = re.compile(
-    r"^\s*(?:\[?\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:[.,]\d+)?\]?)?"
+    r"^\s*(?P<ts>\[?\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:[.,]\d+)?\]?)?"
     r"\s*(?:[-|:]\s*)?"
-    r"(?:\[?(?:DEBUG|INFO|WARNING|WARN|ERROR|CRITICAL)\]?)?"
+    r"(?:\[" + _LEVELS + r"\]"
+    r"|" + _LEVELS + r"(?![A-Za-z0-9_])(?=\s*[-|:])"
+    r"|(?(ts)" + _LEVELS + r"(?![A-Za-z0-9_])))?"
     r"\s*(?:[-|:]\s*)?"
 )
 
 # A duration written as a clock. Matched before the label matcher so that
 # "Duration: 0:00:07" is read as seven seconds and never as zero.
 HMS_DURATION_RE = re.compile(
-    r"(?i)\b(?P<label>duration|elapsed time|processing time|total execution time|total time)\s*:\s*"
+    r"(?i)\b(?P<label>duration|total duration|elapsed time|processing time|total execution time|"
+    r"total time|run[ _]?time)\s*:\s*"
     r"(?:(?P<hours>\d+):)?(?P<minutes>\d{1,2}):(?P<seconds>\d{1,2}(?:\.\d+)?)"
 )
 # The seconds field takes one digit or two, like the minutes field. A logger
@@ -137,11 +151,23 @@ HMS_DURATION_RE = re.compile(
 # the one shape of clock the clock matcher did not recognise.
 
 # "Records updated: 1,432". The label may not contain a pipe, so a logger's
-# module field in "ts | INFO | update_parcels | Records checked: 47285" is left
+# module field in "ts | INFO | update_parcels | Records checked: 12000" is left
 # out of the key.
 LABEL_VALUE_RE = re.compile(
-    r"(?P<label>[A-Za-z][A-Za-z0-9 /()_-]{2,80}?)\s*:\s*(?P<value>-?\d[\d,]*(?:\.\d+)?)\b"
+    r"(?P<label>[A-Za-z][A-Za-z0-9 /()_-]{2,80}?)\s*:\s*(?P<value>-?\d[\d,]*(?:\.\d+)?)"
+    r"(?:\s*(?P<unit>milliseconds?|msecs?|ms|seconds?|secs?|s|minutes?|mins?|hours?|hrs?|h)\b|\b)"
 )
+
+# A duration label, by its normalized key. One pattern, shared by the built-in
+# duration rule and by the unit conversion, so the two cannot drift apart.
+_DURATION_KEYS = (r"(?:duration|total_duration|elapsed_time|processing_time|total_time|"
+                  r"total_execution_time|run_time|runtime)")
+
+# What follows the number when the number is really a date or a clock: the "03"
+# of "03:14:07", the "12" of "12/31/2025", the year of "2026-03-04". A label
+# that holds a timestamp ("Updated: 2026-03-04 03:14:07") must not chart the
+# year or the hour as a measurement.
+STAMP_TAIL_RE = re.compile(r"(?::\d|/\d|-\d\d-\d\d)")
 
 # "Updated 1432 records". The same measurement written as a sentence.
 VERB_VALUE_RE = re.compile(
@@ -150,6 +176,26 @@ VERB_VALUE_RE = re.compile(
     r"(?:\s+(?P<value>\d[\d,]*(?:\.\d+)?))?"
     r"(?:\s+(?P<object>[A-Za-z][A-Za-z0-9 _/-]{0,60}))?"
 )
+
+# sample_line is the log line a number came from, copied into the csv and json.
+# A line that holds a count can also hold a credential ("...?token=...&f=json
+# found 500 features"), so these are blanked first. Best effort, not a promise:
+# a secret with no name beside it cannot be found.
+_SECRET_NAMES = (r"(?:access[_-]?token|refresh[_-]?token|id[_-]?token|token|password|passwd|"
+                 r"pwd|passphrase|secret|client[_-]?secret|api[_-]?key|apikey|auth|key|sig|"
+                 r"signature|credentials?)")
+REDACTIONS = [
+    (re.compile(r"(?i)\b(authorization\s*[:=]\s*)(?:(?:bearer|basic|negotiate|token)\s+)?[^\s,;\"']+"),
+     r"\1REDACTED"),
+    (re.compile(r"(?i)\b(bearer\s+)[A-Za-z0-9._~+/=-]{8,}"), r"\1REDACTED"),
+    (re.compile(r"(?i)\b(" + _SECRET_NAMES + r"\s*[=:]\s*)(?:\"[^\"]*\"|'[^']*'|[^\s&;,)\]\"']+)"),
+     r"\1REDACTED"),
+    (re.compile(r"(?i)\b([a-z][a-z0-9+.-]*://)[^/\s:@]*:[^/\s@]+@"), r"\1REDACTED@"),
+]
+
+# An error line: the log level ERROR, CRITICAL or FATAL as its own token, in any
+# of the usual layouts ("| ERROR |", "ts ERROR msg", "[ERROR]").
+ERROR_LEVEL_RE = re.compile(r"(?:^|[\s\[|])(?:ERROR|CRITICAL|FATAL)(?=$|[\s\]|:-])")
 
 # Keys that look like measurements and are not. Each of these reached a chart.
 # start_time and time are clocks. finished, failed and runtimeerror are words
@@ -181,8 +227,7 @@ _NOUN = r"(?:records?|rows?|features?)"
 # in a --rules file, which is checked first and wins.
 CANONICAL_METRIC_RULES = [
     (re.compile(pattern), canonical) for pattern, canonical in [
-        (r"^(?:duration|elapsed_time|processing_time|total_time|total_execution_time|run_time|runtime)$",
-         "duration_seconds"),
+        (r"^%s$" % _DURATION_KEYS, "duration_seconds"),
         (r"^(?:updated|%s_updated|updated_%s|updated_total|updated_count|updated_in_\d+)$" % (_NOUN, _NOUN),
          "updated_record_count"),
         (r"^(?:deleted|removed|%s_(?:deleted|removed)|(?:deleted|removed)_%s|total_deleted|deleted_count|removed_count)$" % (_NOUN, _NOUN),
@@ -220,6 +265,13 @@ FORMATS = ("table", "csv", "json")
 
 
 # ----------------------------------------------------------------- pure core
+
+def redact(line):
+    """The line with any secret that has a name beside it blanked."""
+    for pattern, replacement in REDACTIONS:
+        line = pattern.sub(replacement, line)
+    return line
+
 
 def parse_number(text):
     """A log's number, thousands separators and all, or None."""
@@ -313,7 +365,7 @@ def minutes_off_schedule(started, scheduled):
 
 def section_name(line):
     """The section a banner line opens, as a key, or None if it is no banner."""
-    match = SECTION_RE.match(line)
+    match = SECTION_RE.match(line) if len(line) <= SECTION_LINE_MAX else None
     if not match or not re.search(r"[A-Za-z]", match.group("name")):
         return None
     return normalize_metric_key(match.group("name")[:SECTION_NAME_MAX])
@@ -367,10 +419,25 @@ def canonicalize_metric_key(metric_key, rules=()):
     return key
 
 
-def extract_metrics_from_line(line):
+def unit_seconds(unit):
+    """Seconds in one unit word as LABEL_VALUE_RE captures it: ms, s, min or h."""
+    unit = unit.lower()
+    if unit.startswith("ms") or unit.startswith("milli"):
+        return 0.001
+    if unit.startswith("h"):
+        return 3600.0
+    if unit.startswith("m"):
+        return 60.0
+    return 1.0
+
+
+def extract_metrics_from_line(line, refuse_stamps=False):
     """Raw (label, value) pairs for one line, before any canonical rule.
 
     The preamble is stripped first. Within one line a raw label is mined once.
+    A duration label with a unit is converted to seconds. With refuse_stamps, a
+    number that is the front of a date or a clock is not a value at all;
+    mine_line always asks for that, and only the raw pass leaves it off.
     """
     line = LOG_PREAMBLE_RE.sub("", line, count=1)
     results = []
@@ -388,6 +455,10 @@ def extract_metrics_from_line(line):
     for match in LABEL_VALUE_RE.finditer(line):
         label = normalize_metric_key(match.group("label"))
         value = parse_number(match.group("value"))
+        if refuse_stamps and STAMP_TAIL_RE.match(line, match.end("value")):
+            continue
+        if match.group("unit") and re.search(r"duration|elapsed|(?:^|_)time$|runtime", label):
+            value = value * unit_seconds(match.group("unit"))
         if label and value is not None and label not in seen:
             seen.add(label)
             results.append((label, value))
@@ -395,6 +466,8 @@ def extract_metrics_from_line(line):
     for match in VERB_VALUE_RE.finditer(line):
         value = parse_number(match.group("value") or "")
         if value is None:
+            continue
+        if refuse_stamps and STAMP_TAIL_RE.match(line, match.end("value")):
             continue
         object_text = normalize_metric_key(match.group("object") or "")
         label = match.group("lemma").lower()
@@ -421,7 +494,7 @@ def mine_line(line, rules=()):
     """
     results = []
     seen = set()
-    for raw_key, value in extract_metrics_from_line(line):
+    for raw_key, value in extract_metrics_from_line(line, refuse_stamps=True):
         canonical = canonicalize_metric_key(raw_key, rules)
         if canonical is None or canonical in seen:
             continue
@@ -656,13 +729,14 @@ def scan_log_file(path, max_lines=DEFAULT_MAX_LINES, rules=(), tail=False, secti
     """
     metrics = {}
     lines_scanned = error_lines = warning_lines = 0
+    truncated = False
 
     try:
         handle = path.open("rb")
     except OSError as exc:
         _emit("WARNING: could not read %s: %s" % (path, exc))
         return {"metrics": {}, "lines_scanned": 0, "error_lines": 0, "warning_lines": 0,
-                "started": None, "encoding": None}
+                "started": None, "encoding": None, "unreadable": True, "truncated": False}
 
     with handle:
         sample = handle.read(SNIFF_BYTES)
@@ -679,10 +753,15 @@ def scan_log_file(path, max_lines=DEFAULT_MAX_LINES, rules=(), tail=False, secti
             line = raw_line.strip()
             if not line:
                 continue
+            # A further line past the cap: the file was cut short, and a total the
+            # job writes last was never read. Say so rather than chart a stale one.
+            if 0 < max_lines <= lines_scanned:
+                truncated = True
+                break
             lines_scanned += 1
             lower = line.lower()
-            if ("traceback" in lower or " - error -" in lower
-                    or " failed" in lower or lower.startswith("error")):
+            if ("traceback" in lower or " - error -" in lower or " failed" in lower
+                    or lower.startswith("error") or ERROR_LEVEL_RE.search(line)):
                 error_lines += 1
             if "warning" in lower:
                 warning_lines += 1
@@ -696,14 +775,16 @@ def scan_log_file(path, max_lines=DEFAULT_MAX_LINES, rules=(), tail=False, secti
                 for key, value in mine_line(line, rules):
                     if section is not None:
                         key = section + "." + key
-                    metrics[key] = (value, line[:240])
+                    metrics[key] = (value, redact(line)[:240])
 
-            if 0 < max_lines <= lines_scanned:
-                break
-
+    if truncated:
+        _emit("WARNING: read only the first %d line(s) of %s; the rest was not mined, so "
+              "a total written last is missing. Use --tail, or --max-lines 0."
+              % (lines_scanned, path.name))
     return {"metrics": metrics, "lines_scanned": lines_scanned,
             "error_lines": error_lines, "warning_lines": warning_lines,
-            "started": started, "encoding": codec}
+            "started": started, "encoding": codec, "unreadable": False,
+            "truncated": truncated}
 
 
 def build_rows(paths, rules=(), max_lines=DEFAULT_MAX_LINES, tail=False, sections=False,
@@ -728,7 +809,9 @@ def build_rows(paths, rules=(), max_lines=DEFAULT_MAX_LINES, tail=False, section
         observed = datetime.fromtimestamp(mtime, tz=timezone.utc).isoformat()
         scan = scan_log_file(path, max_lines, rules, tail, sections)
         manual = False
-        if scheduled and scan["started"] is None:
+        if scan["unreadable"]:
+            pass
+        elif scheduled and scan["started"] is None:
             _emit("WARNING: %s has no timestamp at its start, so a manual run cannot be "
                   "told from a scheduled one; kept" % path.name)
         elif scheduled:
@@ -754,9 +837,28 @@ def build_rows(paths, rules=(), max_lines=DEFAULT_MAX_LINES, tail=False, section
             "warning_lines": scan["warning_lines"],
             "metrics_found": len(scan["metrics"]),
             "manual_run": manual,
+            "unreadable": scan["unreadable"],
         })
     rows.sort(key=lambda row: (row["metric_key"], row["observed_at_utc"], row["log_file"]))
     return rows, summaries
+
+
+def write_stdout(text):
+    """The data to stdout as UTF-8 bytes, whatever code page stdout was given.
+
+    A redirected stdout on Windows is cp1252, which cannot hold a sample_line
+    with an arrow, a CJK letter or the U+FFFD of an undecodable byte; the write
+    then dies with UnicodeEncodeError after the metrics were mined, and the
+    empty file looks like "nothing to chart". write_text already writes UTF-8
+    bytes. LF only, so the same logs give the same bytes on every platform.
+    """
+    buffer = getattr(sys.stdout, "buffer", None)
+    if buffer is None:
+        sys.stdout.write(text)
+        return
+    sys.stdout.flush()
+    buffer.write(text.encode("utf-8"))
+    buffer.flush()
 
 
 def write_text(path, text, apply_it):
@@ -861,11 +963,11 @@ def self_test():
           "a key gets a readable display name")
 
     # ---- the pinned defect: the log level is not part of the metric name
-    for preamble in ("2026-08-11 03:14:07 - INFO - ",
-                     "2026-08-11 03:14:07 | INFO | ",
-                     "2026-08-11 03:14:07 INFO - ",
-                     "[2026-08-11 03:14:07] ",
-                     "2026-08-11 03:14:07 "):
+    for preamble in ("2026-03-04 03:14:07 - INFO - ",
+                     "2026-03-04 03:14:07 | INFO | ",
+                     "2026-03-04 03:14:07 INFO - ",
+                     "[2026-03-04 03:14:07] ",
+                     "2026-03-04 03:14:07 "):
         line = preamble + "Duration: 0:00:07"
         check(mine_line(line) == [("duration_seconds", 7.0)],
               "%r mines exactly one pair, seven seconds  <-- pinned defect"
@@ -873,30 +975,30 @@ def self_test():
         check(not [key for key, _ in extract_metrics_from_line(line) if key.startswith("info_")],
               "%r never mines an info_ key  <-- pinned defect" % preamble.strip())
 
-    check(mine_line("2026-08-11 17:45:13,116 - INFO - Duration: 0:00:07.133764")
+    check(mine_line("2026-03-04 17:45:13,116 - INFO - Duration: 0:00:07.133764")
           == [("duration_seconds", 7.133764)],
           "a comma separated millisecond stamp is preamble, not a metric")
     check(mine_line("INFO - Records updated: 69") == [("updated_record_count", 69.0)],
           "a level with no timestamp is preamble too")
     check(mine_line("WARNING: Records checked: 12") == [("checked_record_count", 12.0)],
           "a level followed by a colon is preamble too")
-    check(mine_line("2026-08-10 08:17:33 | INFO | update_parcels | Records checked: 47285")
-          == [("checked_record_count", 47285.0)],
+    check(mine_line("2026-03-03 08:17:33 | INFO | update_parcels | Records checked: 12000")
+          == [("checked_record_count", 12000.0)],
           "a logger's module field does not become part of the key")
     check(dict(extract_metrics_from_line(
-        "2026-08-12 08:21:36,932 - INFO -   Verification: 15,562 features in hosted layer"
-    )).get("verification") == 15562.0,
+        "2026-03-05 08:21:36,932 - INFO -   Verification: 3,000 features in hosted layer"
+    )).get("verification") == 3000.0,
           "stripping the preamble does not swallow the payload  <-- pinned defect")
 
     # ---- the pinned defect: a number that is really a clock
-    check(extract_metrics_from_line("Start time: 2026-08-11 03:14:07")
+    check(extract_metrics_from_line("Start time: 2026-03-04 03:14:07")
           == [("start_time", 2026.0)],
           "a start time really does mine the year as a number  <-- pinned defect")
     check(canonicalize_metric_key("start_time") is None,
           "and start_time is refused as a metric  <-- pinned defect")
-    check(mine_line("2026-08-11 03:14:00 - INFO - Start time: 2026-08-11 03:14:07") == [],
+    check(mine_line("2026-03-04 03:14:00 - INFO - Start time: 2026-03-04 03:14:07") == [],
           "so the line yields nothing at all  <-- pinned defect")
-    check(mine_line("Finished at: 2026-08-11 03:14:07") == [],
+    check(mine_line("Finished at: 2026-03-04 03:14:07") == [],
           "a finish time is refused the same way")
     check(canonicalize_metric_key("time") is None, "a bare time is not a metric")
     check(canonicalize_metric_key("finished") is None, "finished is not a metric")
@@ -951,7 +1053,7 @@ def self_test():
           "an hour, two minutes and thirty seconds is 3750 seconds")
     check(mine_line("Duration: 02:30") == [("duration_seconds", 150.0)],
           "a clock with no hours field is minutes and seconds")
-    check(mine_line("2026-08-11 03:14:07 - INFO - Duration: 0:00:7")
+    check(mine_line("2026-03-04 03:14:07 - INFO - Duration: 0:00:7")
           == [("duration_seconds", 7.0)],
           "a hand formatted clock with a one digit seconds field is still a clock, "
           "not the zero of its hours  <-- pinned defect")
@@ -972,7 +1074,7 @@ def self_test():
           "and the label form gives the same key and the same number")
     check(mine_line("Updated 1432 rows") == [("updated_record_count", 1432.0)],
           "rows and records are one series, not two")
-    check(mine_line("Loaded 47285 source records") == [("source_record_count", 47285.0)],
+    check(mine_line("Loaded 12000 source records") == [("source_record_count", 12000.0)],
           "a source count is mined")
     check(mine_line("Deleted 0 features") == [("deleted_record_count", 0.0)],
           "a real zero is mined: only a zero that is a clock is refused")
@@ -1013,8 +1115,8 @@ def self_test():
     # ---- a rules file
     rules = load_rules('{"^verification$": "verified_record_count"}')
     check(len(rules) == 1, "a one rule document compiles to one rule")
-    check(mine_line("Verification: 15,562 features in hosted layer", rules)
-          == [("verified_record_count", 15562.0)],
+    check(mine_line("Verification: 3,000 features in hosted layer", rules)
+          == [("verified_record_count", 3000.0)],
           "a supplied rule mines a label the vocabulary filter would refuse")
     beats = load_rules('{"^duration$": "duration_ms"}')
     check(canonicalize_metric_key("duration", beats) == "duration_ms",
@@ -1041,10 +1143,10 @@ def self_test():
 
     # ---- rendering
     sample = [{"metric_key": "duration_seconds", "display_name": "Duration Seconds",
-               "metric_value": 7.133764, "observed_at_utc": "2026-08-11T03:14:07+00:00",
+               "metric_value": 7.133764, "observed_at_utc": "2026-03-04T03:14:07+00:00",
                "log_file": "nightly.log", "sample_line": "Duration: 0:00:07, ok"},
               {"metric_key": "updated_record_count", "display_name": "Updated Record Count",
-               "metric_value": 1432.0, "observed_at_utc": "2026-08-11T03:14:07+00:00",
+               "metric_value": 1432.0, "observed_at_utc": "2026-03-04T03:14:07+00:00",
                "log_file": "nightly.log", "sample_line": "Records updated: 1,432"}]
     check(format_value(1432.0) == "1432", "a whole number prints without a decimal point")
     check(format_value(7.133764) == "7.133764", "a fraction keeps every digit it was given")
@@ -1065,7 +1167,7 @@ def self_test():
     check(",1432," in body, "the csv carries 1432, not 1432.0")
 
     # ---- encoding sniffing
-    text = "2026-08-11 03:14:07 - INFO - Records updated: 5\r\n"
+    text = "2026-03-04 03:14:07 - INFO - Records updated: 5\r\n"
     check(sniff_encoding(text.encode("utf-8")) == ("utf-8", 0, 1),
           "plain ascii is utf-8, as before")
     check(sniff_encoding(codecs.BOM_UTF8 + text.encode("utf-8")) == ("utf-8", 3, 1),
@@ -1101,11 +1203,11 @@ def self_test():
     check(tail_lines("a\nb\nc", 0, True) == ["a", "b", "c"], "a tail of 0 is every line")
 
     # ---- the start of a run
-    check(start_minutes(["2026-08-11 03:14:07,001 - INFO - start"]) == 194,
+    check(start_minutes(["2026-03-04 03:14:07,001 - INFO - start"]) == 194,
           "the first timestamp is the start, 03:14 is minute 194")
-    check(start_minutes(["=====", "[2026-08-11 22:05:00] begin", "2026-08-11 23:59:00 x"]) == 1325,
+    check(start_minutes(["=====", "[2026-03-04 22:05:00] begin", "2026-03-04 23:59:00 x"]) == 1325,
           "a banner before it is skipped, and only the first stamp counts")
-    check(start_minutes(["2026-08-11 25:14:07 bad", "2026-08-11 03:14:07 ok"]) is None,
+    check(start_minutes(["2026-03-04 25:14:07 bad", "2026-03-04 03:14:07 ok"]) is None,
           "an impossible first stamp is unknown, not a later line's time")
     check(start_minutes(["no stamp here", ""]) is None, "a log with no stamp has no start")
     check(parse_clock("03:14") == 194 and parse_clock(" 3:14 ") == 194,
@@ -1123,9 +1225,9 @@ def self_test():
     check(section_name("=== Roads ===") == "roads", "a banner names its section")
     check(section_name("### Parcels (pass 2) ###") == "parcels_pass_2",
           "a section name becomes a key like any label")
-    check(section_name("2026-08-11 03:14:07 - INFO - ----- Step 2: Roads -----") == "step_2_roads",
+    check(section_name("2026-03-04 03:14:07 - INFO - ----- Step 2: Roads -----") == "step_2_roads",
           "a banner behind a logging preamble is still a banner")
-    check(section_name("2026-08-11 03:14:07 --- Roads ---") == "roads",
+    check(section_name("2026-03-04 03:14:07 --- Roads ---") == "roads",
           "a dash fence behind a timestamp is not eaten as a separator  <-- pinned defect")
     check(section_name("==========") is None, "a rule line with no name is not a banner")
     check(section_name("=== 5 ===") is None, "a banner with no letter in it is not a section")
@@ -1144,10 +1246,10 @@ def self_test():
         project = os.path.join(tmp, "proj")
         script = os.path.join(project, "nightly.py")
         write(script, "")
-        write(os.path.join(project, "Logs", "nightly_0811.log"),
-              "2026-08-11 03:14:00 - INFO - Start time: 2026-08-11 03:14:00\n"
-              "2026-08-11 03:14:03 - INFO - Records updated: 1,432\n"
-              "2026-08-11 03:14:07 - INFO - Duration: 0:00:07.133764\n")
+        write(os.path.join(project, "Logs", "nightly_0304.log"),
+              "2026-03-04 03:14:00 - INFO - Start time: 2026-03-04 03:14:00\n"
+              "2026-03-04 03:14:03 - INFO - Records updated: 1,432\n"
+              "2026-03-04 03:14:07 - INFO - Duration: 0:00:07.133764\n")
         found = discover_log_directories(script)
         check(any(path.name == "Logs" for path in found),
               "the Logs folder beside the script is found")
@@ -1227,7 +1329,7 @@ def self_test():
         old = write(os.path.join(project, "Logs", "nightly_0501.log"), "Records updated: 1\n")
         os.utime(old, (1000000000, 1000000000))
         files = recent_log_files([logdir], days_back=30)
-        check(len(files) == 1 and files[0].name == "nightly_0811.log",
+        check(len(files) == 1 and files[0].name == "nightly_0304.log",
               "a log older than the window is left out")
         check(len(recent_log_files([logdir], days_back=36500)) == 2,
               "and is mined when the window is wide enough to reach it")
@@ -1244,7 +1346,7 @@ def self_test():
               "a file that is not there has no timestamp")
 
         # ---- scanning one file
-        scan = scan_log_file(logdir / "nightly_0811.log")
+        scan = scan_log_file(logdir / "nightly_0304.log")
         check(scan["lines_scanned"] == 3, "every non blank line is counted")
         check(scan["metrics"]["duration_seconds"][0] == 7.133764,
               "the real duration survives the whole pipeline  <-- pinned defect")
@@ -1258,10 +1360,15 @@ def self_test():
               "the last value in a file wins, because a running total ends at the total")
         check(scan_log_file(Path(running))["lines_scanned"] == 3,
               "a blank line is not a line that was scanned")
-        check(scan_log_file(Path(running), max_lines=2)["lines_scanned"] == 2,
-              "the line limit stops the read early")
-        check(scan_log_file(Path(running), max_lines=2)["metrics"]["updated_record_count"][0] == 20.0,
+        capped, _, cap_warned = capture(lambda: scan_log_file(Path(running), max_lines=2))
+        check(capped["lines_scanned"] == 2, "the line limit stops the read early")
+        check(capped["metrics"]["updated_record_count"][0] == 20.0,
               "and the metric reflects only the lines that were read")
+        check(capped["truncated"] and "running.log" in cap_warned and "--tail" in cap_warned,
+              "and a file cut by the limit says so, naming the file  <-- pinned defect")
+        exact, _, exact_warned = capture(lambda: scan_log_file(Path(running), max_lines=3))
+        check(not exact["truncated"] and exact_warned == "",
+              "a file of exactly the limit is not called cut  <-- pinned defect")
         # --max-lines 0 means no limit, which is what the README promises. Drop
         # the "0 <" from the limit test and 0 stops the read at the first line
         # instead: the file is read, nothing is mined, and the run reports
@@ -1269,9 +1376,9 @@ def self_test():
         check(scan_log_file(Path(running), max_lines=0)["lines_scanned"] == 3,
               "--max-lines 0 reads the whole file rather than none of it")
         noisy = write(os.path.join(tmp, "noisy.log"),
-                      "2026-08-11 03:14:00 - ERROR - job failed\n"
+                      "2026-03-04 03:14:00 - ERROR - job failed\n"
                       "Traceback (most recent call last):\n"
-                      "2026-08-11 03:14:01 - WARNING - retrying\n")
+                      "2026-03-04 03:14:01 - WARNING - retrying\n")
         noisy_scan = scan_log_file(Path(noisy))
         check(noisy_scan["error_lines"] == 2, "an error line and a traceback line are counted")
         check(noisy_scan["warning_lines"] == 1, "warning lines are counted separately")
@@ -1296,8 +1403,8 @@ def self_test():
                 handle.write(data)
             return Path(path)
 
-        run = ("2026-08-11 03:14:07 - INFO - Records updated: 1,432\r\n"
-               "2026-08-11 03:14:09 - INFO - Duration: 0:00:07\r\n")
+        run = ("2026-03-04 03:14:07 - INFO - Records updated: 1,432\r\n"
+               "2026-03-04 03:14:09 - INFO - Duration: 0:00:07\r\n")
         want = {"updated_record_count": 1432.0, "duration_seconds": 7.0}
         bom8 = scan_log_file(wbytes("bom8.log", codecs.BOM_UTF8 + run.encode("utf-8")))
         check(dict((key, pair[0]) for key, pair in bom8["metrics"].items()) == want,
@@ -1334,7 +1441,7 @@ def self_test():
               "--tail with --max-lines 0 reads the whole file")
         check(scan_log_file(Path(running), max_lines=99, tail=True)["lines_scanned"] == 3,
               "a tail longer than the file is the whole file")
-        long_text = "".join("2026-08-11 03:%02d:00 - INFO - Records updated: %d\n" % (i % 60, i)
+        long_text = "".join("2026-03-04 03:%02d:00 - INFO - Records updated: %d\n" % (i % 60, i)
                             for i in range(1, 401))
         longlog = wbytes("long.log", long_text.encode("utf-8"))
         small = scan_log_file(longlog, max_lines=3, tail=True, block=64)
@@ -1391,11 +1498,11 @@ def self_test():
 
         # ---- sections
         sectioned = write(os.path.join(tmp, "sections.log"),
-                          "2026-08-11 03:14:00 - INFO - Records checked: 70\n"
-                          "2026-08-11 03:14:01 - INFO - === Parcels ===\n"
-                          "2026-08-11 03:14:02 - INFO - Records updated: 10\n"
-                          "2026-08-11 03:14:03 - INFO - ===== Road Centerlines =====\n"
-                          "2026-08-11 03:14:04 - INFO - Records updated: 5\n")
+                          "2026-03-04 03:14:00 - INFO - Records checked: 70\n"
+                          "2026-03-04 03:14:01 - INFO - === Parcels ===\n"
+                          "2026-03-04 03:14:02 - INFO - Records updated: 10\n"
+                          "2026-03-04 03:14:03 - INFO - ===== Road Centerlines =====\n"
+                          "2026-03-04 03:14:04 - INFO - Records updated: 5\n")
         flat = scan_log_file(Path(sectioned))
         check(flat["metrics"]["updated_record_count"][0] == 5.0
               and "parcels.updated_record_count" not in flat["metrics"],
@@ -1423,14 +1530,14 @@ def self_test():
 
         # ---- manual runs
         manual_log = write(os.path.join(tmp, "manual", "run_1042.log"),
-                           "2026-08-11 10:42:00 - INFO - Records updated: 3\n")
+                           "2026-03-04 10:42:00 - INFO - Records updated: 3\n")
         late_log = write(os.path.join(tmp, "manual", "run_0320.log"),
-                         "2026-08-11 03:20:00 - INFO - Records updated: 1400\n")
+                         "2026-03-04 03:20:00 - INFO - Records updated: 400\n")
         bare_log = write(os.path.join(tmp, "manual", "run_bare.log"), "Records updated: 9\n")
         at = [parse_clock("03:14")]
         (rows, summaries), _, warned = capture(
             lambda: build_rows([Path(manual_log), Path(late_log)], scheduled=at))
-        check([row["metric_value"] for row in rows] == [1400.0],
+        check([row["metric_value"] for row in rows] == [400.0],
               "a run at 10:42 for a job scheduled at 03:14 is left out of the series  <-- pinned defect")
         check([summary["manual_run"] for summary in summaries] == [True, False],
               "and is still counted as a file that was read")
@@ -1444,15 +1551,15 @@ def self_test():
         check(len(rows) == 1 and "no timestamp at its start" in warned,
               "a run with no timestamp is kept, with a warning that it could not be told")
         slow = write(os.path.join(tmp, "slow", "run.log"),
-                     "2026-08-11 03:14:00 - INFO - start\n"
-                     + "2026-08-11 04:00:00 - INFO - working\n" * 40
-                     + "2026-08-11 05:30:00 - INFO - Records updated: 77\n")
+                     "2026-03-04 03:14:00 - INFO - start\n"
+                     + "2026-03-04 04:00:00 - INFO - working\n" * 40
+                     + "2026-03-04 05:30:00 - INFO - Records updated: 77\n")
         rows, _ = build_rows([Path(slow)], max_lines=2, tail=True, scheduled=at)
         check([row["metric_value"] for row in rows] == [77.0],
               "a long run read with --tail is judged by its first line, not its last  <-- pinned defect")
 
         # ---- rows
-        rows, summaries = build_rows([logdir / "nightly_0811.log"])
+        rows, summaries = build_rows([logdir / "nightly_0304.log"])
         check(len(rows) == 2 and rows[0]["metric_key"] == "duration_seconds",
               "one row per metric per file, sorted by key")
         check(rows[0]["display_name"] == "Duration Seconds", "each row carries a display name")
@@ -1567,7 +1674,7 @@ def self_test():
         rc, out, err = capture(lambda: main([str(logdir), "--max-lines", "0"]))
         check(rc == 0 and "7.133764" in out,
               "--max-lines 0 reads to the end of the file, it does not read nothing")
-        rc, out, err = capture(lambda: main([str(logdir / "nightly_0811.log")]))
+        rc, out, err = capture(lambda: main([str(logdir / "nightly_0304.log")]))
         check(rc == 0 and "duration_seconds" in out, "a log file can be named directly")
 
         empty = os.path.join(tmp, "empty")
@@ -1576,8 +1683,8 @@ def self_test():
         check(rc == 1 and "no log file" in err,
               "a folder with no recent log is exit 1 and says which folder it read")
         quiet = write(os.path.join(tmp, "quiet", "run.log"),
-                      "2026-08-11 03:14:00 - INFO - Start time: 2026-08-11 03:14:00\n"
-                      "2026-08-11 03:14:07 - INFO - Widgets: 12\n")
+                      "2026-03-04 03:14:00 - INFO - Start time: 2026-03-04 03:14:00\n"
+                      "2026-03-04 03:14:07 - INFO - Widgets: 12\n")
         rc, out, err = capture(lambda: main([os.path.dirname(quiet)]))
         check(rc == 1, "a log whose every number is refused is exit 1, not a silent success")
         check("1 log file(s)" in err, "and it says it really did read the file")
@@ -1601,8 +1708,8 @@ def self_test():
                            '{"^verification$": "verified_record_count",\n'
                            ' "^updated_%s$": null}' % "records?")
         veri = write(os.path.join(tmp, "veri", "run.log"),
-                     "2026-08-12 08:21:36,932 - INFO - Verification: 15,562 features\n"
-                     "2026-08-12 08:21:37,001 - INFO - Updated records: 41\n")
+                     "2026-03-05 08:21:36,932 - INFO - Verification: 3,000 features\n"
+                     "2026-03-05 08:21:37,001 - INFO - Updated records: 41\n")
         rc, out, err = capture(lambda: main([os.path.dirname(veri), "--rules", rules_file]))
         check(rc == 0 and "verified_record_count" in out,
               "a supplied rule mines a metric the built-in rules refuse")
@@ -1626,7 +1733,7 @@ def self_test():
               "--sections through main charts two series")
         rc, out, err = capture(lambda: main([os.path.dirname(manual_log), "--days", "36500",
                                              "--scheduled-at", "03:14"]))
-        check(rc == 0 and "1400" in out and " 3 " not in out
+        check(rc == 0 and " 400 " in out and " 3 " not in out
               and "1 manual run(s) left out" in err,
               "--scheduled-at through main leaves the manual run out and counts it")
         rc, out, err = capture(lambda: main([manual_log, "--scheduled-at", "03:14"]))
@@ -1661,6 +1768,168 @@ def self_test():
                                              os.path.join(tmp, "nowhere", "x.csv"), "--apply"]))
         check(rc == 2 and "could not write" in err,
               "a write that fails is exit 2, not a false success")
+
+        # ---- the audit round: each case below reached a chart or crashed a run
+        started_at = datetime.now()
+        check(section_name("=== a" + " " * 100000 + "b") is None
+              and (datetime.now() - started_at).total_seconds() < 5,
+              "a banner-shaped line of 100000 spaces is refused at once, not backtracked  <-- pinned defect")
+        check(section_name("=" * 100 + " Roads " + "=" * 100) == "roads",
+              "while a banner with a wide fence is still a banner")
+        # A duration clock under a label the clock matcher did not list was read
+        # as the zero of its hours field.
+        for text in ("Run time: 0:00:07", "Runtime: 0:00:07", "Total duration: 0:00:07",
+                     "2026-03-04 03:14:07 - INFO - Run_time: 0:00:07"):
+            check(mine_line(text) == [("duration_seconds", 7.0)],
+                  "%r is seven seconds, never the zero of its hours  <-- pinned defect" % text)
+        check(mine_line("Runtime: 12:34") == [("duration_seconds", 754.0)],
+              "a clock with no hours field is minutes and seconds")
+
+        # A timestamp after a label or a verb is not a measurement.
+        for text in ("Updated: 2026-03-04 03:14:07", "Created: 2026-03-04 03:14:07",
+                     "Last updated: 2026-03-04 03:14:07", "Layer updated 2026-03-04 03:14:07",
+                     "Updated: 2026-03-04T03:14:07Z", "Data last updated: 12/31/2025",
+                     "Records checked as of 2026-03-04 03:14:07"):
+            check(mine_line(text) == [], "%r mines nothing  <-- pinned defect" % text)
+        check(extract_metrics_from_line("Created: 2026-03-04 03:14:07") == [("created", 2026.0)],
+              "and the raw pass really does mine the year, so the guard is load bearing")
+        check(mine_line("Records updated: 2,026") == [("updated_record_count", 2026.0)],
+              "while a count that merely looks like a year is still a count")
+
+        # Units: a duration is charted in seconds whatever the log wrote.
+        check(mine_line("Processing time: 1432 ms") == [("duration_seconds", 1.432)],
+              "milliseconds are converted to seconds  <-- pinned defect")
+        check(mine_line("Duration: 12 minutes") == [("duration_seconds", 720.0)],
+              "minutes are converted to seconds  <-- pinned defect")
+        check(mine_line("Elapsed time: 2 hours") == [("duration_seconds", 7200.0)],
+              "hours are converted to seconds  <-- pinned defect")
+        check(mine_line("Duration: 7.5s") == [("duration_seconds", 7.5)],
+              "a unit with no space is read, not skipped past")
+        check(mine_line("Duration: 3 seconds") == [("duration_seconds", 3.0)],
+              "seconds stay seconds")
+        check(mine_line("Records updated: 5 min") == [("updated_record_count", 5.0)],
+              "and a unit beside a count that is not a duration is left alone")
+        check([unit_seconds(unit) for unit in ("MS", "milliseconds", "h", "Hrs", "min", "sec")]
+              == [0.001, 0.001, 3600.0, 3600.0, 60.0, 1.0],
+              "each unit word maps to its seconds")
+
+        # A level word is stripped only when it is a level.
+        check(mine_line("ERROR COUNT: 3") == [("error_count", 3.0)],
+              "ERROR COUNT keeps its first word  <-- pinned defect")
+        check(mine_line("WARNING count: 2") == [("warning_count", 2.0)],
+              "WARNING count keeps its first word, so it is not the series 'count'  <-- pinned defect")
+        check(mine_line("ERRORS: 4") == [("errors", 4.0)],
+              "ERRORS is a label, not the level ERROR and an S  <-- pinned defect")
+        check(mine_line("[INFO] Records updated: 3") == [("updated_record_count", 3.0)],
+              "a bracketed level is still preamble")
+        for level in ("INFO", "ERROR"):
+            check(mine_line("2026-03-04 03:14:07 %s Records updated: 3" % level)
+                  == [("updated_record_count", 3.0)],
+                  "a level after a timestamp with no dash is still preamble (%s)" % level)
+
+        # sample_line is a log line, so a secret on it is blanked.
+        for secret_line, secret in (
+                ("GET https://h/q?token=AAAA1234&f=json found 500", "AAAA1234"),
+                ("user=svc password=Hunter2! ; Records checked: 12", "Hunter2!"),
+                ("Authorization: Bearer abcdef0123456789 Records checked: 1", "abcdef0123456789"),
+                ("sent bearer abcdef0123456789 Records checked: 1", "abcdef0123456789"),
+                ("ftp://bob:pw0rd@host/x Records checked: 1", "pw0rd"),
+                ("api_key: 'two words' Records checked: 1", "two words"),
+                ("client_secret=xyz987 Records checked: 1", "xyz987")):
+            check(secret not in redact(secret_line) and "REDACTED" in redact(secret_line),
+                  "%r is blanked  <-- pinned defect" % secret_line.split()[0][:16])
+        check(redact("2026-03-04 03:14:07 - INFO - Records checked: 12")
+              == "2026-03-04 03:14:07 - INFO - Records checked: 12",
+              "a line with no secret is left exactly as it was")
+        check(redact("primary_key=5 monkey=7") == "primary_key=5 monkey=7",
+              "a word that merely ends in key is not a secret name")
+        secret_log = write(os.path.join(tmp, "secret", "run.log"),
+                           "2026-03-04 03:14:07 - INFO - GET https://h/q?token=AAAA1234&f=json found 500 features\n"
+                           "2026-03-04 03:14:09 - INFO - password=Hunter2! ; Records checked: 12\n")
+        rows_secret, _ = build_rows([Path(secret_log)])
+        check(len(rows_secret) == 2 and not any(
+            "AAAA1234" in row["sample_line"] or "Hunter2!" in row["sample_line"]
+            for row in rows_secret),
+              "no mined row carries the token or the password  <-- pinned defect")
+        rc, out, err = capture(lambda: main([secret_log, "--format", "json"]))
+        check(rc == 0 and "AAAA1234" not in out and "Hunter2" not in out and "found_features" in out,
+              "and neither reaches stdout, while the metrics are still mined  <-- pinned defect")
+
+        # Error lines in every common layout.
+        layouts = write(os.path.join(tmp, "layouts", "e.log"),
+                        "2026-03-03 08:17:33 | ERROR | job | boom\n"
+                        "2026-03-03 08:17:34 ERROR connection lost\n"
+                        "[ERROR] third\n"
+                        "2026-03-03 08:17:35 CRITICAL disk\n"
+                        "2026-03-03 08:17:36 - INFO - no error found\n")
+        check(scan_log_file(Path(layouts))["error_lines"] == 4,
+              "four error layouts are four error lines, and 'no error found' is not one  <-- pinned defect")
+
+        # An unreadable log is exit 3, never a quiet 0 or a false 'nothing to chart'.
+        real_open = Path.open
+
+        def deny_locked(self, *args, **kwargs):
+            if self.name == "locked.log":
+                raise PermissionError(13, "Permission denied")
+            return real_open(self, *args, **kwargs)
+
+        both = write(os.path.join(tmp, "locks", "good.log"), "Records updated: 5\n")
+        write(os.path.join(tmp, "locks", "locked.log"), "Records updated: 9\n")
+        Path.open = deny_locked
+        try:
+            rc, out, err = capture(lambda: main([os.path.dirname(both)]))
+            rc_only, out_only, err_only = capture(
+                lambda: main([os.path.join(os.path.dirname(both), "locked.log")]))
+            (_, locked_summaries), _, locked_err = capture(
+                lambda: build_rows([Path(os.path.dirname(both)) / "locked.log"], scheduled=[194]))
+        finally:
+            Path.open = real_open
+        check(rc == 3 and "updated_record_count" in out and "1 log file(s) could not be read" in err,
+              "one unreadable log among good ones is exit 3, and the good rows still print  <-- pinned defect")
+        check(rc_only == 3 and "survived the rules" not in err_only,
+              "and an unreadable log alone is not blamed on the rules  <-- pinned defect")
+        check(locked_summaries[0]["unreadable"] and "no timestamp" not in locked_err,
+              "and it is not also called a log with no timestamp")
+        check(summaries[0]["unreadable"] is False, "a log that was read is not marked unreadable")
+
+        # stdout is UTF-8 bytes, not the redirect's code page.
+        arrow = write(os.path.join(tmp, "uni", "arrow.log"),
+                      "2026-03-04 03:14:07 - INFO - \u2713 Records updated: 12 \u2192 done\n")
+        cp_buffer = io.BytesIO()
+        cp_stdout = io.TextIOWrapper(cp_buffer, encoding="cp1252", errors="strict")
+        raises(lambda: cp_stdout.write("\u2713"),
+               "a cp1252 stdout cannot hold the sample line, so writing text to it is the crash  <-- pinned defect")
+        old_out, old_err = sys.stdout, sys.stderr
+        sys.stdout, sys.stderr = cp_stdout, io.StringIO()
+        try:
+            rc = main([arrow, "--format", "csv"])
+            cp_stdout.flush()
+        finally:
+            sys.stdout, sys.stderr = old_out, old_err
+        csv_bytes = cp_buffer.getvalue()
+        check(rc == 0 and "\u2713 Records updated: 12 \u2192 done" in csv_bytes.decode("utf-8")
+              and b"\r" not in csv_bytes,
+              "a csv with a check mark and an arrow reaches a cp1252 stdout as UTF-8, rc 0  <-- pinned defect")
+        check(csv_bytes.count(b"\n") == 2, "and as LF only")
+
+        # A file cut by --max-lines says so, through main too.
+        rc, out, err = capture(lambda: main([str(longlog), "--max-lines", "3"]))
+        check(rc == 0 and "WARNING: read only the first 3 line(s)" in err,
+              "main warns when the line limit cut a log short  <-- pinned defect")
+
+        # Characterised limits, so a change to them is a decision and not an accident.
+        prefixed = "Parcels - Records updated: 500"
+        check(mine_line(prefixed) == [("parcels_records_updated", 500.0)],
+              "a task name before the label stays in the key: it is its own series")
+        check(mine_line(prefixed, load_rules('{"^parcels_records_updated$": "updated_record_count"}'))
+              == [("updated_record_count", 500.0)],
+              "and a rule maps it onto the shared series")
+        shared = write(os.path.join(tmp, "shared", "nightly.py"), "")
+        write(os.path.join(tmp, "shared", "other_20260917.log"), "Records updated: 9\n")
+        write(os.path.join(tmp, "shared", "notes.txt"), "Records updated: 500\n")
+        found = [path.name for path in recent_log_files(discover_log_directories(shared))]
+        check(sorted(found) == ["notes.txt", "other_20260917.log"],
+              "--script reads every log and txt in the script's folder, other jobs' too")
 
         # ---- the harness itself. A check() that cannot record a failure would
         # report every defect above as a pass, which is the one failure no other
@@ -1864,7 +2133,7 @@ def main(argv=None):
             text = None
 
     if text is not None:
-        sys.stdout.write(text)
+        write_stdout(text)
 
     _emit("logsift: %d log file(s), %d line(s), %d metric row(s), %d error line(s)"
           % (len(summaries),
@@ -1874,6 +2143,11 @@ def main(argv=None):
     if args.scheduled_at:
         _emit("logsift: %d manual run(s) left out of the series"
               % sum(1 for summary in summaries if summary["manual_run"]))
+    unreadable = sum(1 for summary in summaries if summary["unreadable"])
+    if unreadable:
+        _emit("ERROR: %d log file(s) could not be read, so their runs are missing from "
+              "the series. Exit 3, not 0 or 1." % unreadable)
+        return 3
     if not rows:
         _emit("no number in those logs survived the rules. Run with --rules to "
               "name the labels this job uses.")
