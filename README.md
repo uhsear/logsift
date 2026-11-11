@@ -46,6 +46,7 @@ PASS  '2026-03-04 03:14:07 | INFO |' mines exactly one pair, seven seconds  <-- 
 PASS  '[2026-03-04 03:14:07]' mines exactly one pair, seven seconds  <-- pinned defect
 ...
 PASS  an ISO stamp with Z is preamble, not part of the metric key  <-- pinned defect
+...
 PASS  a logger's module field does not become part of the key
 PASS  stripping the preamble does not swallow the payload  <-- pinned defect
 PASS  a start time really does mine the year as a number  <-- pinned defect
@@ -70,6 +71,12 @@ PASS  a rule written against the canonical key reaches the label too  <-- pinned
 ...
 PASS  the csv is LF only, so Windows and Linux write the same bytes  <-- pinned defect
 ...
+PASS  the log_file cell starting with a carriage return gets a leading apostrophe  <-- pinned defect
+PASS  the sample_line cell starting with = gets a leading apostrophe  <-- pinned defect
+...
+PASS  a negative metric_value stays a number, with no apostrophe  <-- pinned defect
+PASS  a text cell with a carriage return inside it stays one cell of one row, on every Python  <-- pinned defect
+...
 PASS  a utf-8 bom is found and skipped  <-- pinned defect
 PASS  a utf-16le bom, as powershell 5.1 > and >> write, is found  <-- pinned defect
 ...
@@ -82,6 +89,9 @@ PASS  so one shared log is not charted as every job's own  <-- pinned defect
 PASS  an ancestor spelled with a .. is refused too  <-- pinned defect
 PASS  an ancestor is refused even when the script's folder is not local  <-- pinned defect
 PASS  Logs and LOGS are ONE directory where the filesystem folds case  <-- pinned defect
+...
+PASS  one unlistable folder among good ones is exit 3, and the good rows still print  <-- pinned defect
+PASS  and an unlistable folder alone is exit 3, not 'nothing to chart'  <-- pinned defect
 ...
 PASS  the real duration survives the whole pipeline  <-- pinned defect
 ...
@@ -98,6 +108,8 @@ PASS  with --sections each section is its own series  <-- pinned defect
 ...
 PASS  a run at 10:42 for a job scheduled at 03:14 is left out of the series  <-- pinned defect
 ...
+PASS  a manual run whose first stamp is US dated is left out, not kept  <-- pinned defect
+...
 PASS  a long run read with --tail is judged by its first line, not its last  <-- pinned defect
 ...
 PASS  and it is not counted as a log file that was read  <-- pinned defect
@@ -112,6 +124,8 @@ PASS  one bad path among good ones fails the whole run  <-- pinned defect
 ...
 PASS  stdout carries ONLY the data, so a redirect gives a clean csv  <-- pinned defect
 ...
+PASS  --scheduled-at through main leaves manual runs out, counts them, and is exit 3 for a log it could not classify  <-- pinned defect
+...
 PASS  --out without --apply writes NOTHING  <-- pinned defect
 ...
 PASS  and writes it INSTEAD of stdout, not as well as  <-- pinned defect
@@ -119,6 +133,9 @@ PASS  and writes exactly what the dry run printed  <-- pinned defect
 ...
 PASS  and leaves the existing file untouched  <-- pinned defect
 PASS  a write that fails is exit 2, not a false success
+PASS  a log file named @job.log and lines that start with - or @ reach the csv guarded  <-- pinned defect
+...
+PASS  and the file --apply writes carries the same guard  <-- pinned defect
 ...
 PASS  'Run time: 0:00:07' is seven seconds, never the zero of its hours  <-- pinned defect
 ...
@@ -126,32 +143,31 @@ PASS  'Updated: 2026-03-04 03:14:07' mines nothing  <-- pinned defect
 ...
 PASS  milliseconds are converted to seconds  <-- pinned defect
 ...
+PASS  'Total time: 1h 2m 3s' is 3723.0 seconds, the sum of its units  <-- pinned defect
+...
 PASS  ERROR COUNT keeps its first word  <-- pinned defect
 ...
 PASS  'DB_PASSWORD' is blanked  <-- pinned defect
 ...
+PASS  the value of the flag in '--password hunter2' is blanked  <-- pinned defect
+...
+PASS  the tail of 'config pwd=Hun;ter2XYZ R' is blanked too  <-- pinned defect
+...
+PASS  the tail of 'SDE_PWD=Hunter3Real foun' is blanked too  <-- pinned defect
+...
+PASS  a secret with a semicolon in it never reaches metric_key, display_name or sample_line  <-- pinned defect
 PASS  TOKX12 from csv never reaches metric_key or display_name  <-- pinned defect
 ...
 PASS  no mined row carries the token or the password  <-- pinned defect
 ...
 PASS  one unreadable log among good ones is exit 3, and the good rows still print  <-- pinned defect
 ...
-PASS  one unlistable folder among good ones is exit 3, and the good rows still print  <-- pinned defect
-PASS  and an unlistable folder alone is exit 3, not 'nothing to chart'  <-- pinned defect
+PASS  a folder the account cannot traverse is exit 3, not a PermissionError traceback  <-- pinned defect
+PASS  a secret in a banner never reaches a key under --sections, in csv  <-- pinned defect
 ...
 PASS  a csv with a check mark and an arrow reaches a cp1252 stdout as UTF-8, rc 0  <-- pinned defect
 ...
-PASS  the sample_line cell starting with = gets a leading apostrophe  <-- pinned defect
-PASS  the log_file cell starting with a carriage return gets a leading apostrophe  <-- pinned defect
-PASS  a negative metric_value stays a number, with no apostrophe  <-- pinned defect
-PASS  a text cell with a carriage return inside it stays one cell of one row, on every Python  <-- pinned defect
-PASS  a log file named @job.log and lines that start with - or @ reach the csv guarded  <-- pinned defect
-PASS  and the file --apply writes carries the same guard  <-- pinned defect
-...
-PASS  the value of the flag in '--password hunter2' is blanked  <-- pinned defect
-PASS  a folder the account cannot traverse is exit 3, not a PermissionError traceback  <-- pinned defect
-PASS  a secret in a banner never reaches a key under --sections, in csv  <-- pinned defect
-PASS  main warns when the line limit cut a log short  <-- pinned defect
+PASS  main warns when the line limit cut a log short, and exits 3, not 0  <-- pinned defect
 ...
 PASS  check() and raises() really do record a failure  <-- pinned defect
 PASS  the self-test leaves no temporary directory behind
@@ -159,7 +175,7 @@ PASS  a failed run's footer names the count and each failure
 PASS  a harness that missed a deliberate failure is named FATAL, not passed over  <-- pinned defect
 PASS  importing the file runs nothing: main() is defined, not called
 --------------------------------------------------------------------
-432 assertions, 0 failed
+455 assertions, 0 failed
 ```
 
 The block above is an excerpt of a real run; the `...` lines stand for omitted lines, and the
@@ -169,11 +185,11 @@ last line is the real footer.
 
 Python 3.9 or newer. Nothing to install, no `arcpy`, no third-party package, no network and no
 database. It runs on ArcGIS Pro's Python and on a plain `python3` equally. The self-test above
-runs 432 assertions on Windows with Python 3.13, 3.12, 3.10 and 3.9, and 432 on Linux with
+runs 455 assertions on Windows with Python 3.13, 3.12, 3.10 and 3.9, and 455 on Linux with
 Python 3.12. The counts are equal on all five. One label differs by platform:
 `Logs and LOGS are ONE directory where the filesystem folds case` on Windows reads `... are TWO
 directories where it does not` on Linux, because the test asserts what each filesystem does.
-Branch coverage of `logsift.py` is 100 percent (1168 statements, 264 branches), measured with
+Branch coverage of `logsift.py` is 100 percent (1211 statements, 278 branches), measured with
 `python -m coverage run --branch logsift.py --self-test`. `pyflakes` is clean, and the file
 compiles with `python -W error`.
 
@@ -297,8 +313,10 @@ Three shapes of line, in this order, and at most one value per canonical key per
 - **A verb and a number.** `Updated 1432 records`, `Deleted 0 features`.
 
 A duration with a unit is converted to seconds too: `Processing time: 1432 ms` is 1.432,
-`Duration: 12 minutes` is 720 and `Elapsed time: 2 hours` is 7200. A unit beside any other label is
-left alone.
+`Duration: 12 minutes` is 720 and `Elapsed time: 2 hours` is 7200. A duration written in several
+units is the sum of them: `Total time: 1h 2m 3s` is 3723, `Duration: 2h 30m` is 9000 and
+`Duration: 1 hour, 5 minutes and 2 seconds` is 3902. The units are `ms`, `s`, `m`, `h` and their
+long spellings. A unit beside any other label is left alone.
 
 The label is then normalised to a key and mapped onto a canonical name, so that `Records
 updated`, `Updated 1432 rows` and `updated_count` are one series rather than three. Eight
@@ -312,21 +330,25 @@ That line is copied into the `sample_line` column of the csv and json. A line th
 can also hold a credential, such as `GET .../query?token=...&f=json found 500 features`, so a
 value after `token`, `password`, `passwd`, `pwd`, `secret`, `api_key`, `key`, `auth` or `sig`
 (with `=` or `:`), after `Authorization:` or `Bearer`, and the password in `scheme://user:pass@`
-is replaced with `REDACTED`. The long names match inside a longer word, so `DB_PASSWORD=`,
-`PGPASSWORD=`, `authToken=` and `x_api_key=` are covered, and a quoted name such as `"token":
-"..."` in json or a Python dict is covered. `key`, `sig` and `auth` must start a word, so
-`primary_key=5` is left alone. The line is blanked before anything is mined from it, so a secret
-cannot reach `metric_key` or `display_name` either. This is best effort. A secret with no name
-beside it cannot be found, and neither can one with a space and no `=` or `:` after its name
-(`password hunter2`). A value with a space in it that is not quoted ends at the space. A command
-line flag with a space before its value, such as `--password hunter2` or the PowerShell form
-`-Password hunter2`, is covered, and so is the same flag with a quoted value. A `Cookie:` header
-(`sid=...`) is not covered. The name list is fixed: `pass=`, `pat=`, `AccountKey=` and a
-URL-encoded name such as `token%3Dabc` are not recognised, and `token=abc,def` leaves `,def`
-visible because an unquoted value stops at the comma. A banner under `--sections` is blanked the
-same way, before it names a section. The text
-of a key built from words that sit before a number is the log's own text, so a secret written as
-plain words there is not covered.
+is replaced with `REDACTED`. The long names, including `pwd`, match inside a longer word, so
+`DB_PASSWORD=`, `SDE_PWD=`, `PGPASSWORD=`, `authToken=` and `x_api_key=` are covered, and a quoted
+name such as `"token": "..."` in json or a Python dict is covered. `key`, `sig` and `auth` must
+start a word, so `primary_key=5` is left alone. A quoted value may hold an escaped quote. An
+unquoted value runs to the next space, and a comma, semicolon, bracket or ampersand ends it only
+when a `name=` follows, so `token=abc&f=json` keeps its `f=json` and `pwd=Hun;ter2` leaves
+nothing of `ter2` behind. The line is blanked before anything is mined from it, so a secret
+cannot reach `metric_key` or `display_name` in those forms either. This is best effort. A secret
+with no name beside it cannot be found, and neither can one with a space and no `=` or `:` after
+its name (`password hunter2`). A value with a space in it that is not quoted ends at the space,
+and the rest of it stays visible. A command line flag with a space before its value, such as
+`--password hunter2`, `--client-secret hunter2` or the PowerShell form `-Password hunter2`, is
+covered, and so is the same flag with a quoted value. The name list is fixed. A `Cookie:` header
+(`sid=...`), `pass=`, `pat=`, `AccountKey=`, a URL-encoded name such as `token%3Dabc`, a short
+flag such as `-p VALUE`, a bare `code=` OAuth value, `bearer=VALUE`, a `Set-Cookie:
+sessionid=...` value and a token with no name beside it are not recognised. A banner under
+`--sections` is blanked the same way, before it names a section. The text of a key built from
+words that sit before a number is the log's own text, so a secret written as plain words there is
+not covered.
 
 ```
 $ python logsift.py tok.log --format csv
@@ -490,7 +512,8 @@ the first timestamp of each log, which is when the run started, and leaves out t
 that started more than `--slack` minutes (default 30) from every scheduled time. The distance is
 measured round the clock, so a task scheduled at 23:50 that starts at 00:05 is 15 minutes late.
 The run is still read and counted, stderr names it, and a run left out is never silent.
-A log with no timestamp at its start cannot be told either way, and is kept with a warning.
+A log with no timestamp at its start cannot be told either way. It is kept, stderr names it,
+and the run exits 3.
 If every run was manual, the exit code is 1, not an empty success.
 
 Python `logging` writes `asctime` in local time by default
@@ -561,8 +584,9 @@ because you named the key yourself. That is how `verification` above gets mined 
 
 ## Exit codes
 
-0 metrics mined, 1 nothing to chart, 2 the write step failed, 3 a log file could not be read or
-a folder could not be listed, 64 usage error. Every usage error exits 64, including one that
+0 metrics mined, 1 nothing to chart, 2 the write step failed, 3 the series is known to be
+incomplete or unclassified (a log file could not be read, a folder could not be listed,
+`--max-lines` cut a log short, or `--scheduled-at` could not classify a log), 64 usage error. Every usage error exits 64, including one that
 the argument parser raises, such as an unknown flag or `--days x`.
 
 Exit 1 is the interesting one. It means the tool read log files and no number in them survived
@@ -575,6 +599,14 @@ exits 3 so a scheduled wrapper does not take a missing run for a complete series
 checked before exit 1, so an unreadable file is never blamed on the rules. A folder that cannot
 be listed is the same failure and the same exit: every run in it is missing, so the run exits 3
 even when other folders gave rows, and also when no other folder did.
+
+Exit 3 is also the answer when the tool knows a result is incomplete and would otherwise print it
+as clean. With the default `--max-lines 5000` and no `--tail`, a log longer than the limit was read
+only to the limit, a total written last was never read, and the run says so and exits 3. Use
+`--tail` or `--max-lines 0` and the same log exits 0. Under `--scheduled-at`, a log whose first
+stamp the tool cannot read (no stamp, or one that is not ISO or `MM/DD/YYYY`, such as a time
+only `10:42:07 INFO ...`) cannot be told from a scheduled run, so it is kept, named on stderr, and
+the run exits 3. A US dated stamp (`08/11/2026 10:42:07`, with or without `AM` or `PM`) is read.
 
 A log file that is deleted between the listing and the read is skipped with a warning on stderr,
 and the run can still exit 0, so a file rotated away during a scan leaves a gap with no failing
@@ -605,8 +637,8 @@ refusing the numbers that are not measurements, and noticing that two spellings 
 - It has no history and no state. Every run reads the log files that are there now. The series
   is as long as your retention, and rotation deletes your chart.
 - A metric's value is the last one in the file that was read. Without `--tail` that is the last
-  one in the first `--max-lines` lines (5000 by default), and stderr says so when the cap cut the
-  file short. A job that writes its totals at the end of a long log needs `--tail` or
+  one in the first `--max-lines` lines (5000 by default), and stderr says so and the run exits 3
+  when the cap cut the file short. A job that writes its totals at the end of a long log needs `--tail` or
   `--max-lines 0`. A job that reports the same key for two different things gets one row and the
   second value.
 - A sentence count takes the words after the number as its key, so `Updated 1432 records in the
@@ -656,10 +688,10 @@ refusing the numbers that are not measurements, and noticing that two spellings 
   updated: 5 ***`, is eaten the same way. A banner whose first 40 characters hold no letter or digit
   has an empty section name, and its keys become `.updated_record_count`. A line over 1000
   characters is never a banner.
-- With `--scheduled-at`, a log whose first stamp is not `YYYY-MM-DD HH:MM:SS` (for example
-  `08/11/2026 10:42:07`, or a time only `10:42:07 INFO ...`) cannot be classified. It is kept with
-  a warning on stderr and the run still exits 0, so exit 0 does not mean the manual-run filter
-  ran on every file.
+- With `--scheduled-at`, a log whose first stamp is neither `YYYY-MM-DD HH:MM:SS` nor
+  `MM/DD/YYYY HH:MM:SS` (for example a time only `10:42:07 INFO ...`) cannot be classified. It is
+  kept, stderr names it, and the run exits 3, so a manual run among them is not taken for a clean
+  series.
 - A time only preamble such as `10:42:07 INFO Records updated: 3` is not stripped, so the level
   word stays in the key (`info_records_updated`) and starts a separate series from the dated form
   of the same line.
@@ -708,14 +740,13 @@ refusing the numbers that are not measurements, and noticing that two spellings 
   file name is printed raw in the table and on stderr, and only the csv guards the first character.
 - `| head -1` ends the run with a `BrokenPipeError` traceback and exit 1, the same code as
   `nothing to chart`, so exit 1 is ambiguous when the output goes through a pipe that can close.
-- Exit 0 does not mean every file was read to the end. The default `--max-lines 5000` without
-  `--tail` reads only the first 5000 lines, so a total written last is replaced by an early
-  value. The only signal is a warning on stderr, which an unattended run does not read.
 - A line whose only number is an HTTP status in an error line, such as `Error: 404 Not Found`, is
   charted as the metric `error = 404`. The tool refuses a number that was never a measurement
   only by label, not by meaning.
-- `Elapsed: 00:01:07` mines nothing, because `elapsed` alone is not in the list of duration
-  labels. `Elapsed time:` is. This is a missed value, not a wrong one.
+- `Elapsed: 00:01:07` and `Elapsed: 0:07:13` mine nothing, because `elapsed` alone is not in the
+  list of duration labels. The labels read as durations are `duration`, `total duration`,
+  `elapsed time`, `processing time`, `total execution time`, `total time` and `run time` (also
+  `runtime`). This is a missed value, not a wrong one, and a `--rules` file adds a label.
 - A sentence count keeps the words after the number in its key, and a total in those words changes
   the key: `Processed 500 of 10000 records` is `processed_of_10000_records`, a new series when the
   total changes.
@@ -739,6 +770,36 @@ refusing the numbers that are not measurements, and noticing that two spellings 
   forgets `--apply` looks successful. stderr says `Nothing written`, and the data goes to stdout.
 - The vocabulary filter is a word list. A job that counts "widgets" needs a rule, and there is no
   way for the tool to guess that one for you.
+- Naming a csv file on the command line, for example `logsift metrics.csv`, mines it as ordinary
+  log text and keeps no apostrophe strip. The tool does not parse its own csv back, but it will
+  read one if you name it. The exclusion of `.csv` files applies only to a directory scan.
+- The tail timing figures above (0.134 s for `--tail` and 29.188 s for a full read of a 163 MB
+  UTF-16LE file) are machine dependent. A second measurement on the same machine gave 0.115 s and
+  52.6 s, so the full read can take much longer than the figure quoted.
+- The list of same-named repositories in the Name section depends on a GitHub search made on
+  2026-11-11. A quick second search found the same kinds of projects, but the list will drift.
+- Promtail, Datadog and Splunk are named in the comparison with no source link, so that
+  comparison is the author's description and not a checked fact. mtail and grok_exporter are
+  linked.
+- Space grouped thousands are not read: `Records updated: 12 345` charts 12. Only comma grouping
+  is handled.
+- A duration written in several units with no clock is summed (`Duration: 7m 13s` is 433), but
+  `Duration: 1h2m3s`, with no spaces between the pieces, writes no row and no warning.
+- A file that begins with the bytes `FF FE` but is not UTF-16, for example a cp1252 log whose first
+  line starts with those bytes, is read as UTF-16LE and mines nothing.
+- A count of about 400 digits prints `inf` in the csv `metric_value` column too. A spreadsheet
+  reads that as text.
+- The self-test assertion about folded case expects a case sensitive filesystem on every platform
+  except Windows, so it fails on a default case insensitive macOS volume. This was reasoned from
+  the code, not run.
+- Sources does not cite Windows case folding, NTFS 8.3 short names or Python csv quoting rules.
+  The `Start-Transcript -Append` claim and the same-name repository claim were not re-checked
+  against a live page.
+- `Key: 5` redacts the count, because a bare `key` followed by a colon is treated as a secret.
+  A flag that merely ends in a secret word, such as `--primary-key 5`, is redacted too. Both are
+  false positives, not leaks.
+- A secret whose value holds a space, such as `PGPASSWORD=Hunter 2XYZ`, leaves the part after the
+  space visible, and the word after it can reach `metric_key`.
 
 ## Name
 

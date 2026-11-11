@@ -92,6 +92,9 @@ DEFAULT_SLACK_MINUTES = 30
 # The first timestamp in a log is when the run started. Python logging writes
 # asctime as "2003-07-08 16:49:45,896", in local time, by default.
 START_STAMP_RE = re.compile(r"^\s*\[?\d{4}-\d{2}-\d{2}[ T](\d{2}):(\d{2}):\d{2}")
+# The US layout the line matcher also reads, with an optional 12 hour clock.
+US_START_STAMP_RE = re.compile(
+    r"^\s*\[?\d{2}/\d{2}/\d{4} (\d{2}):(\d{2}):\d{2}(?:[.,]\d+)?(?: ?(?P<meridiem>[AP]M))?")
 
 # --sections: a banner line names the section the lines under it belong to.
 # "=== Roads ===", "### Parcels ###", "----- Step 2: Roads -----". The same
@@ -156,13 +159,18 @@ HMS_DURATION_RE = re.compile(
 # hours field: the flat zero this whole tool exists to refuse, arriving through
 # the one shape of clock the clock matcher did not recognise.
 
+_UNITS = r"milliseconds?|msecs?|ms|seconds?|secs?|s|minutes?|mins?|m|hours?|hrs?|h"
+
 # "Records updated: 1,432". The label may not contain a pipe, so a logger's
 # module field in "ts | INFO | update_parcels | Records checked: 12000" is left
 # out of the key.
 LABEL_VALUE_RE = re.compile(
     r"(?P<label>[A-Za-z][A-Za-z0-9 /()_-]{2,80}?)\s*:\s*(?P<value>-?\d[\d,]*(?:\.\d+)?)"
-    r"(?:\s*(?P<unit>milliseconds?|msecs?|ms|seconds?|secs?|s|minutes?|mins?|hours?|hrs?|h)\b|\b)"
+    r"(?:\s*(?P<unit>" + _UNITS + r")\b|\b)"
 )
+# Further "2m 3s" pieces of a duration written in several units.
+DURATION_TAIL_RE = re.compile(
+    r"\s*(?:,\s*|and\s+)?(?P<value>\d+(?:\.\d+)?)\s*(?P<unit>" + _UNITS + r")\b")
 
 # A duration label, by its normalized key. One pattern, shared by the built-in
 # duration rule and by the unit conversion, so the two cannot drift apart.
@@ -192,19 +200,25 @@ VERB_VALUE_RE = re.compile(
 # sig, auth) must start a word, so primary_key=5 and monkey=7 are left alone. The
 # name may be quoted, as in JSON and a Python dict, and may end in a word such as
 # _hash or Id.
-_SECRET_NAMES = (r"(?:token|password|passwd|passphrase|secret|credentials?|"
+_SECRET_NAMES = (r"(?:token|password|passwd|passphrase|secret|credentials?|pwd|"
                  r"(?:api|private|access|signing|encryption|ssh|master)[_-]?key|"
-                 r"\b(?:auth|key|sig|signature|pwd))")
+                 r"\b(?:auth|key|sig|signature))")
+# A quoted value may hold an escaped quote. An unquoted one runs to the next
+# space; a comma, semicolon, bracket or ampersand ends it only when a "name="
+# follows, so "token=abc&f=json" keeps its f=json and "pwd=Hun;ter2" does not
+# leave "ter2" behind.
+_QUOTED_VALUE = r"\"(?:[^\"\\]|\\.)*\"|'(?:[^'\\]|\\.)*'"
+_BARE_VALUE = r"[^\s&;,)\]]+(?:[&;,)\]](?![\w.-]+=)[^\s&;,)\]]*)*"
 _SECRET_SUFFIX = r"(?:[_-]?(?:hash|value|string|id|access[_-]?key|key|token|secret))*"
 REDACTIONS = [
     (re.compile(r"(?i)\b(authorization\s*[:=]\s*)(?:(?:bearer|basic|negotiate|token)\s+)?[^\s,;\"']+"),
      r"\1REDACTED"),
     (re.compile(r"(?i)\b(bearer\s+)[A-Za-z0-9._~+/=-]{8,}"), r"\1REDACTED"),
     (re.compile(r"(?i)(" + _SECRET_NAMES + _SECRET_SUFFIX + r"[\"']?\s*[=:]\s*)"
-                r"(?:\"[^\"]*\"|'[^']*'|[^\s&;,)\]\"']+)"),
+                r"(?:" + _QUOTED_VALUE + r"|" + _BARE_VALUE + r")"),
      r"\1REDACTED"),
-    (re.compile(r"(?i)(?<!\S)(--?" + _SECRET_NAMES + _SECRET_SUFFIX + r"\s+)"
-                r"(?:\"[^\"]*\"|'[^']*'|[^\s-][^\s]*)"), r"\1REDACTED"),
+    (re.compile(r"(?i)(?<!\S)(--?[a-z0-9_-]*?" + _SECRET_NAMES + _SECRET_SUFFIX + r"\s+)"
+                r"(?:" + _QUOTED_VALUE + r"|[^\s-][^\s]*)"), r"\1REDACTED"),
     (re.compile(r"(?i)\b([a-z][a-z0-9+.-]*://)[^/\s:@]*:[^/\s@]+@"), r"\1REDACTED@"),
 ]
 
@@ -348,11 +362,18 @@ def start_minutes(lines):
     """
     for line in lines:
         match = START_STAMP_RE.match(line)
-        if match:
-            hour, minute = int(match.group(1)), int(match.group(2))
-            if hour < 24 and minute < 60:
-                return hour * 60 + minute
-            return None
+        us_match = None if match else US_START_STAMP_RE.match(line)
+        stamp = match or us_match
+        if not stamp:
+            continue
+        hour, minute = int(stamp.group(1)), int(stamp.group(2))
+        if us_match and us_match.group("meridiem"):
+            if not 1 <= hour <= 12:
+                return None
+            hour = hour % 12 + (12 if us_match.group("meridiem") == "PM" else 0)
+        if hour < 24 and minute < 60:
+            return hour * 60 + minute
+        return None
     return None
 
 
@@ -446,6 +467,16 @@ def unit_seconds(unit):
     return 1.0
 
 
+def _tail_seconds(line, position):
+    """Seconds in the "2m 3s" pieces that follow the first unit of a duration."""
+    seconds = 0.0
+    tail = DURATION_TAIL_RE.match(line, position)
+    while tail:
+        seconds += float(tail.group("value")) * unit_seconds(tail.group("unit"))
+        tail = DURATION_TAIL_RE.match(line, tail.end())
+    return seconds
+
+
 def extract_metrics_from_line(line, refuse_stamps=False):
     """Raw (label, value) pairs for one line, before any canonical rule.
 
@@ -473,7 +504,7 @@ def extract_metrics_from_line(line, refuse_stamps=False):
         if refuse_stamps and STAMP_TAIL_RE.match(line, match.end("value")):
             continue
         if match.group("unit") and re.search(r"duration|elapsed|(?:^|_)time$|runtime", label):
-            value = value * unit_seconds(match.group("unit"))
+            value = value * unit_seconds(match.group("unit")) + _tail_seconds(line, match.end())
         if label and value is not None and label not in seen:
             seen.add(label)
             results.append((label, value))
@@ -860,9 +891,11 @@ def build_rows(paths, rules=(), max_lines=DEFAULT_MAX_LINES, tail=False, section
         observed = datetime.fromtimestamp(mtime, tz=timezone.utc).isoformat()
         scan = scan_log_file(path, max_lines, rules, tail, sections)
         manual = False
+        unclassified = False
         if scan["unreadable"]:
             pass
         elif scheduled and scan["started"] is None:
+            unclassified = True
             _emit("WARNING: %s has no timestamp at its start, so a manual run cannot be "
                   "told from a scheduled one; kept" % path.name)
         elif scheduled:
@@ -888,6 +921,8 @@ def build_rows(paths, rules=(), max_lines=DEFAULT_MAX_LINES, tail=False, section
             "warning_lines": scan["warning_lines"],
             "metrics_found": len(scan["metrics"]),
             "manual_run": manual,
+            "unclassified": unclassified,
+            "truncated": scan["truncated"],
             "unreadable": scan["unreadable"],
         })
     rows.sort(key=lambda row: (row["metric_key"], row["observed_at_utc"], row["log_file"]))
@@ -1681,9 +1716,22 @@ def self_test():
         check(len(rows) == 2, "without --scheduled-at no run is left out, as before")
         rows, _ = build_rows([Path(manual_log)], scheduled=at, slack=500)
         check(len(rows) == 1, "a slack wide enough to reach the run keeps it")
-        (rows, _), _, warned = capture(lambda: build_rows([Path(bare_log)], scheduled=at))
+        (rows, bare_summaries), _, warned = capture(lambda: build_rows([Path(bare_log)], scheduled=at))
         check(len(rows) == 1 and "no timestamp at its start" in warned,
               "a run with no timestamp is kept, with a warning that it could not be told")
+        check([summary["unclassified"] for summary in bare_summaries] == [True],
+              "and the summary marks it unclassified, which main turns into exit 3  <-- pinned defect")
+        us_log = write(os.path.join(tmp, "manual", "run_us.log"),
+                       "08/11/2026 10:42:07 - INFO - Records updated: 3\n")
+        (us_rows, us_summaries), _, _ = capture(lambda: build_rows([Path(us_log)], scheduled=at))
+        check(us_rows == [] and us_summaries[0]["manual_run"] and not us_summaries[0]["unclassified"],
+              "a manual run whose first stamp is US dated is left out, not kept  <-- pinned defect")
+        check([start_minutes([stamp]) for stamp in (
+            "08/11/2026 10:42:07 x", "08/11/2026 10:42:07 PM x", "08/11/2026 12:05:00 AM x",
+            "08/11/2026 12:05:00 PM x", "[08/11/2026 01:00:00,123 AM] x", "08/11/2026 13:00:00 PM x",
+            "08/11/2026 00:10:00 AM x", "08/11/2026 25:00:00 x")]
+              == [642, 1362, 5, 725, 60, None, None, None],
+              "a US stamp gives its start time, on the 12 hour clock too, and an impossible one gives none")
         slow = write(os.path.join(tmp, "slow", "run.log"),
                      "2026-03-04 03:14:00 - INFO - start\n"
                      + "2026-03-04 04:00:00 - INFO - working\n" * 40
@@ -1867,9 +1915,11 @@ def self_test():
               "--sections through main charts two series")
         rc, out, err = capture(lambda: main([os.path.dirname(manual_log), "--days", "36500",
                                              "--scheduled-at", "03:14"]))
-        check(rc == 0 and " 400 " in out and " 3 " not in out
-              and "1 manual run(s) left out" in err,
-              "--scheduled-at through main leaves the manual run out and counts it")
+        check(rc == 3 and " 400 " in out and " 3 " not in out
+              and "2 manual run(s) left out" in err
+              and "1 log file(s) have no timestamp the tool reads" in err,
+              "--scheduled-at through main leaves manual runs out, counts them, and is exit 3 "
+              "for a log it could not classify  <-- pinned defect")
         rc, out, err = capture(lambda: main([manual_log, "--scheduled-at", "03:14"]))
         check(rc == 1 and "no number" in err,
               "a series of only manual runs is exit 1, not an empty success")
@@ -1970,9 +2020,19 @@ def self_test():
               "seconds stay seconds")
         check(mine_line("Records updated: 5 min") == [("updated_record_count", 5.0)],
               "and a unit beside a count that is not a duration is left alone")
-        check([unit_seconds(unit) for unit in ("MS", "milliseconds", "h", "Hrs", "min", "sec")]
-              == [0.001, 0.001, 3600.0, 3600.0, 60.0, 1.0],
+        check([unit_seconds(unit) for unit in ("MS", "milliseconds", "h", "Hrs", "min", "sec", "m")]
+              == [0.001, 0.001, 3600.0, 3600.0, 60.0, 1.0, 60.0],
               "each unit word maps to its seconds")
+        # A duration written in several units is the sum of them, not its first unit.
+        for text, seconds in (("Total time: 1h 2m 3s", 3723.0),
+                              ("Duration: 2h 30m", 9000.0),
+                              ("Duration: 7m 13s", 433.0),
+                              ("Duration: 1 hour, 5 minutes and 2 seconds", 3902.0),
+                              ("Elapsed time: 5 s 250 ms", 5.25)):
+            check(mine_line(text) == [("duration_seconds", seconds)],
+                  "%r is %s seconds, the sum of its units  <-- pinned defect" % (text, seconds))
+        check(mine_line("Records updated: 5 m 3 s") == [("updated_record_count", 5.0)],
+              "the pieces after a unit are added only to a duration label")
 
         # A level word is stripped only when it is a level.
         check(mine_line("ERROR COUNT: 3") == [("error_count", 3.0)],
@@ -2034,6 +2094,30 @@ def self_test():
               "a flag followed by another flag, and a word that only ends in -password, are left alone")
         check(redact("api_key=Hunter 2 ok").endswith("REDACTED 2 ok"),
               "an unquoted value ends at the first space, so a second word stays (limit)")
+        # An unquoted value runs past a comma, semicolon, bracket or ampersand
+        # unless a "name=" follows, and a quoted one may hold an escaped quote.
+        for secret_line, secret in (
+                ("config pwd=Hun;ter2XYZ Records updated: 5", "ter2XYZ"),
+                ("config password=Hunter2,XYZ Records updated: 5", "XYZ"),
+                ("config token=Hun)ter2XYZ Records updated: 5", "ter2XYZ"),
+                ("config secret=Hun&ter2XYZ Records updated: 5", "ter2XYZ"),
+                ("SDE_PWD=Hunter3Real found 5 rows", "Hunter3Real"),
+                ("DB_PWD=Hunter3Real found 5 rows", "Hunter3Real"),
+                ("ARCGIS_PWD=Hunter3Real found 5 rows", "Hunter3Real"),
+                ('{"password":"ab\\"SECRETX"}', "SECRETX"),
+                ('password=ab"SECRETX found 5 rows', "SECRETX"),
+                ("run.py --client-secret SECRETX processed 500 rows", "SECRETX"),
+                ("run.py --db-password SECRETX processed 500 rows", "SECRETX")):
+            check(secret not in redact(secret_line) and "REDACTED" in redact(secret_line),
+                  "the tail of %r is blanked too  <-- pinned defect" % secret_line[:24])
+        check(redact("GET /q?token=A1&f=json found 5") == "GET /q?token=REDACTED&f=json found 5"
+              and redact("Pwd=x;Database=b;") == "Pwd=REDACTED;Database=b;",
+              "a value still ends where the next name= starts")
+        pwd_log = write(os.path.join(tmp, "leak", "pwd.log"),
+                        "2026-03-04 03:14:07 - INFO - config pwd=Hun;ter2XYZ Records updated: 5\n")
+        rc, out, err = capture(lambda: main([pwd_log, "--format", "csv"]))
+        check(rc == 0 and "ter2xyz" not in out.lower() and "redacted_records_updated,Redacted Records Updated,5," in out,
+              "a secret with a semicolon in it never reaches metric_key, display_name or sample_line  <-- pinned defect")
         # The text beside a number becomes metric_key and display_name, so a secret
         # there must go before the key is built, not only from sample_line.
         for leak_line, secret in (
@@ -2151,8 +2235,12 @@ def self_test():
 
         # A file cut by --max-lines says so, through main too.
         rc, out, err = capture(lambda: main([str(longlog), "--max-lines", "3"]))
-        check(rc == 0 and "WARNING: read only the first 3 line(s)" in err,
-              "main warns when the line limit cut a log short  <-- pinned defect")
+        check(rc == 3 and "WARNING: read only the first 3 line(s)" in err
+              and "1 log file(s) were cut short by --max-lines" in err,
+              "main warns when the line limit cut a log short, and exits 3, not 0  <-- pinned defect")
+        rc, out, err = capture(lambda: main([str(longlog), "--max-lines", "0"]))
+        check(rc == 0 and "cut short" not in err,
+              "with no line limit the same log is complete, exit 0")
 
         # Characterised limits, so a change to them is a decision and not an accident.
         prefixed = "Parcels - Records updated: 500"
@@ -2401,7 +2489,16 @@ def main(argv=None):
     if unlisted:
         _emit("ERROR: %d folder(s) could not be listed, so their runs are missing from "
               "the series. Exit 3, not 0 or 1." % len(unlisted))
-    if unreadable or unlisted:
+    unclassified = sum(1 for summary in summaries if summary["unclassified"])
+    if unclassified:
+        _emit("ERROR: %d log file(s) have no timestamp the tool reads at their start, so "
+              "--scheduled-at could not tell a manual run from a scheduled one. Exit 3, "
+              "not 0." % unclassified)
+    truncated = sum(1 for summary in summaries if summary["truncated"])
+    if truncated:
+        _emit("ERROR: %d log file(s) were cut short by --max-lines, so a total written "
+              "last was not read. Use --tail, or --max-lines 0. Exit 3, not 0." % truncated)
+    if unreadable or unlisted or unclassified or truncated:
         return 3
     if not rows:
         _emit("no number in those logs survived the rules. Run with --rules to "
