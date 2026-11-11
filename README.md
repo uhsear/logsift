@@ -155,12 +155,18 @@ PASS  the tail of 'config pwd=Hun;ter2XYZ R' is blanked too  <-- pinned defect
 ...
 PASS  the tail of 'SDE_PWD=Hunter3Real foun' is blanked too  <-- pinned defect
 ...
+PASS  a flag value that starts with a dash is blanked in 'run.exe --password -Ab'  <-- pinned defect
+PASS  the credential in "headers={'Authorization': 'B" is blanked  <-- pinned defect
+...
 PASS  a secret with a semicolon in it never reaches metric_key, display_name or sample_line  <-- pinned defect
 PASS  TOKX12 from csv never reaches metric_key or display_name  <-- pinned defect
 ...
 PASS  no mined row carries the token or the password  <-- pinned defect
 ...
 PASS  one unreadable log among good ones is exit 3, and the good rows still print  <-- pinned defect
+...
+PASS  --max-files keeps the newest only, and exits 3 because an older run was cut  <-- pinned defect
+PASS  a log deleted between the listing and the read exits 3, not 0  <-- pinned defect
 ...
 PASS  a folder the account cannot traverse is exit 3, not a PermissionError traceback  <-- pinned defect
 PASS  a secret in a banner never reaches a key under --sections, in csv  <-- pinned defect
@@ -175,7 +181,7 @@ PASS  a failed run's footer names the count and each failure
 PASS  a harness that missed a deliberate failure is named FATAL, not passed over  <-- pinned defect
 PASS  importing the file runs nothing: main() is defined, not called
 --------------------------------------------------------------------
-455 assertions, 0 failed
+479 assertions, 0 failed
 ```
 
 The block above is an excerpt of a real run; the `...` lines stand for omitted lines, and the
@@ -185,11 +191,11 @@ last line is the real footer.
 
 Python 3.9 or newer. Nothing to install, no `arcpy`, no third-party package, no network and no
 database. It runs on ArcGIS Pro's Python and on a plain `python3` equally. The self-test above
-runs 455 assertions on Windows with Python 3.13, 3.12, 3.10 and 3.9, and 455 on Linux with
+runs 479 assertions on Windows with Python 3.13, 3.12, 3.10 and 3.9, and 479 on Linux with
 Python 3.12. The counts are equal on all five. One label differs by platform:
 `Logs and LOGS are ONE directory where the filesystem folds case` on Windows reads `... are TWO
 directories where it does not` on Linux, because the test asserts what each filesystem does.
-Branch coverage of `logsift.py` is 100 percent (1211 statements, 278 branches), measured with
+Branch coverage of `logsift.py` is 100 percent (1261 statements, 296 branches), measured with
 `python -m coverage run --branch logsift.py --self-test`. `pyflakes` is clean, and the file
 compiles with `python -W error`.
 
@@ -288,7 +294,7 @@ wrote 1835 byte(s) to metrics.csv
 | `--script` | none | A job's script. Its own folder, and any `Logs` folder beside it, are searched. |
 | `--working-directory` | none | The scheduled action's working directory, when it differs from the script's folder. |
 | `--days` | `30` | Only log files modified in the last N days. |
-| `--max-files` | `40` | At most N log files, newest first. |
+| `--max-files` | `40` | At most N log files, newest first. A log in the day window that the limit cuts off is counted on stderr and the run exits 3. A value below 1 is a usage error. |
 | `--max-lines` | `5000` | At most N lines per file. `0` reads the whole file. A file cut short by it is named on stderr. |
 | `--tail` | off | Take `--max-lines` from the END of each file. Cannot be combined with `--sections`. |
 | `--sections` | off | Prefix each key with the banner section it sits under, such as `=== Roads ===`. |
@@ -342,7 +348,15 @@ with no name beside it cannot be found, and neither can one with a space and no 
 its name (`password hunter2`). A value with a space in it that is not quoted ends at the space,
 and the rest of it stays visible. A command line flag with a space before its value, such as
 `--password hunter2`, `--client-secret hunter2` or the PowerShell form `-Password hunter2`, is
-covered, and so is the same flag with a quoted value. The name list is fixed. A `Cookie:` header
+covered, and so is the same flag with a quoted value. A value that starts with a single dash,
+such as `--password -Abc123`, is blanked as a value; only a word that starts with two dashes and a
+letter is read as the next flag and kept. The credential after `Authorization` is blanked in a
+quoted dict or JSON key, in a quoted value, and after `Bearer`, `Basic`, `Negotiate`, `Token`,
+`NTLM`, `HOBA`, `Mutual`, `ApiKey` or `AWS4-HMAC-SHA256`; after `Digest` the rest of the line is
+blanked, because its fields are comma separated. A JSON string held inside a JSON string, which
+writes `\"password\": \"...\"`, is covered. An ODBC value in braces, `PWD={my pass;word}`, is
+blanked whole. An AWS access key id (`AKIA` and 16 capitals or digits) is blanked by its shape
+with no name beside it. The name list is fixed. A `Cookie:` header
 (`sid=...`), `pass=`, `pat=`, `AccountKey=`, a URL-encoded name such as `token%3Dabc`, a short
 flag such as `-p VALUE`, a bare `code=` OAuth value, `bearer=VALUE`, a `Set-Cookie:
 sessionid=...` value and a token with no name beside it are not recognised. A banner under
@@ -467,7 +481,8 @@ few blocks of 64 KiB rather than the whole file. The window is read backwards in
 units, so a UTF-16 or UTF-32 file is never decoded from the middle of a character. The first line
 of the window is dropped when the window does not begin at the start of the file, because half a
 line can mine half a number. The start time used by `--scheduled-at` is always read from the head
-of the file.
+of the file. Lines above the window are never read and are not reported, so a metric written only
+near the top of a long log is absent and the run still exits 0. That is the choice `--tail` makes.
 
 Measured on a 163 MB UTF-16LE log of 1,500,000 lines, on the same Windows machine:
 
@@ -608,9 +623,10 @@ stamp the tool cannot read (no stamp, or one that is not ISO or `MM/DD/YYYY`, su
 only `10:42:07 INFO ...`) cannot be told from a scheduled run, so it is kept, named on stderr, and
 the run exits 3. A US dated stamp (`08/11/2026 10:42:07`, with or without `AM` or `PM`) is read.
 
-A log file that is deleted between the listing and the read is skipped with a warning on stderr,
-and the run can still exit 0, so a file rotated away during a scan leaves a gap with no failing
-exit code. A file that opens and then fails during the read, such as a share that drops, ends the
+A log file that is deleted between the listing and the read, or during the listing, is named on
+stderr and the run exits 3, because its run is missing from the series. The same exit follows when
+`--max-files` cuts off older logs inside the day window: stderr counts them, and `--max-files`
+or `--days` is the fix. A file that opens and then fails during the read, such as a share that drops, ends the
 run with an `OSError` traceback and exit 1, the same code as nothing to chart.
 
 ## Why not Promtail, mtail, or grep
@@ -793,13 +809,40 @@ refusing the numbers that are not measurements, and noticing that two spellings 
   except Windows, so it fails on a default case insensitive macOS volume. This was reasoned from
   the code, not run.
 - Sources does not cite Windows case folding, NTFS 8.3 short names or Python csv quoting rules.
-  The `Start-Transcript -Append` claim and the same-name repository claim were not re-checked
-  against a live page.
+  The same-name repository claim was not re-checked against a live page. The `Start-Transcript
+  -Append` claim was re-read on the PowerShell 5.1 page on 2026-11-11: with `-Append` and a target
+  that has no byte order mark, it defaults to ASCII encoding.
 - `Key: 5` redacts the count, because a bare `key` followed by a colon is treated as a secret.
   A flag that merely ends in a secret word, such as `--primary-key 5`, is redacted too. Both are
   false positives, not leaks.
 - A secret whose value holds a space, such as `PGPASSWORD=Hunter 2XYZ`, leaves the part after the
   space visible, and the word after it can reach `metric_key`.
+- A secret written as plain words with no `=` or `:` after its name, such as `Using token VALUE`,
+  `Token acquired: VALUE`, `with password VALUE` or `Got token VALUE expires in 60 seconds`, stays
+  visible in `sample_line`.
+- A short or plural secret name is not on the fixed list: `pw=`, `cred=`, `tok=`,
+  `subscription_key=`, `tokens:`, `Passwords:` and the SQL tool flag `-P VALUE` are not blanked.
+- A password that holds an `@` in `scheme://user:pa@ss@host` leaves the part after the first `@`
+  visible, and `--password --Abc` is read as a flag followed by a flag, so `--Abc` is kept.
+- `AWS Access Key ID: AKIA...` is blanked by the shape of the id only. A secret key written beside
+  it with no name is not found.
+- The csv guard tests the first character against the six listed ones. A log file name or cell
+  that starts with a line feed, spaces before an `=`, or a full-width sign is written unguarded.
+- A sentence prefixed label splits a series: `Step 2 records updated: 5` is keyed
+  `step_2_records_updated`, not `updated_record_count`. A progress line such as `Checked 5 of 10
+  records` mines the stray key `checked_of_10_records`, a bare `Elapsed: 1.5 min` is converted and
+  then dropped by the vocabulary filter (`Elapsed time: 1.5 min` works), and a count written after
+  the verb (`250 features added`) is not mined.
+- `--days` with a very large number (1000000 or more) ends in an `OverflowError` traceback and
+  exit 1, the same code as nothing to chart.
+- A folder that can be read but not searched (Linux mode 444) lists its files and then ends in a
+  `PermissionError` traceback and exit 1, where mode 000 gives the exit 3 path.
+- A single log line of 3 MB takes about 7 seconds to mine, because the patterns run over the whole
+  line before it is cut to 240 characters.
+- `--out FILE --apply` opens the file for writing directly, so a write that fails part way, such as
+  a full disk, truncates the previous good csv. The write is not atomic.
+- The claim that logsift runs on ArcGIS Pro's Python was exercised under the conda environment
+  `asirpro` (Python 3.11.8), not under a Pro installation's own interpreter.
 
 ## Name
 

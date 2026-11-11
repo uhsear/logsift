@@ -203,22 +203,30 @@ VERB_VALUE_RE = re.compile(
 _SECRET_NAMES = (r"(?:token|password|passwd|passphrase|secret|credentials?|pwd|"
                  r"(?:api|private|access|signing|encryption|ssh|master)[_-]?key|"
                  r"\b(?:auth|key|sig|signature))")
-# A quoted value may hold an escaped quote. An unquoted one runs to the next
+# A quoted value may hold an escaped quote. A value in braces is the ODBC form
+# PWD={my;pass}. An escaped quote pair is a JSON string held inside a JSON
+# string, as a structured logger writes it. An unquoted value runs to the next
 # space; a comma, semicolon, bracket or ampersand ends it only when a "name="
 # follows, so "token=abc&f=json" keeps its f=json and "pwd=Hun;ter2" does not
 # leave "ter2" behind.
-_QUOTED_VALUE = r"\"(?:[^\"\\]|\\.)*\"|'(?:[^'\\]|\\.)*'"
+_QUOTED_VALUE = (r"\\\"(?:(?!\\\").)*\\\"|\"(?:[^\"\\]|\\.)*\"|'(?:[^'\\]|\\.)*'|"
+                 r"\{(?:[^}]|\}\})*\}")
 _BARE_VALUE = r"[^\s&;,)\]]+(?:[&;,)\]](?![\w.-]+=)[^\s&;,)\]]*)*"
 _SECRET_SUFFIX = r"(?:[_-]?(?:hash|value|string|id|access[_-]?key|key|token|secret))*"
+# Schemes a value after Authorization may start with. Digest is handled apart:
+# its fields are comma separated, so the rest of the line is the credential.
+_AUTH_SCHEMES = r"bearer|basic|negotiate|token|ntlm|hoba|mutual|apikey|aws4-hmac-sha256"
 REDACTIONS = [
-    (re.compile(r"(?i)\b(authorization\s*[:=]\s*)(?:(?:bearer|basic|negotiate|token)\s+)?[^\s,;\"']+"),
+    (re.compile(r"(?i)\b(authorization\\?[\"']?\s*[:=]\s*)(?:" + _QUOTED_VALUE + r"|digest\s+.*|"
+                r"(?:" + _AUTH_SCHEMES + r")\s+[^\s,;\"']+|[^\s,;\"']+)"),
      r"\1REDACTED"),
     (re.compile(r"(?i)\b(bearer\s+)[A-Za-z0-9._~+/=-]{8,}"), r"\1REDACTED"),
-    (re.compile(r"(?i)(" + _SECRET_NAMES + _SECRET_SUFFIX + r"[\"']?\s*[=:]\s*)"
+    (re.compile(r"\bAKIA[0-9A-Z]{16}\b"), "REDACTED"),
+    (re.compile(r"(?i)(" + _SECRET_NAMES + _SECRET_SUFFIX + r"\\?[\"']?\s*[=:]\s*)"
                 r"(?:" + _QUOTED_VALUE + r"|" + _BARE_VALUE + r")"),
      r"\1REDACTED"),
     (re.compile(r"(?i)(?<!\S)(--?[a-z0-9_-]*?" + _SECRET_NAMES + _SECRET_SUFFIX + r"\s+)"
-                r"(?:" + _QUOTED_VALUE + r"|[^\s-][^\s]*)"), r"\1REDACTED"),
+                r"(?:" + _QUOTED_VALUE + r"|(?!--[A-Za-z])\S+)"), r"\1REDACTED"),
     (re.compile(r"(?i)\b([a-z][a-z0-9+.-]*://)[^/\s:@]*:[^/\s@]+@"), r"\1REDACTED@"),
 ]
 
@@ -751,12 +759,13 @@ def discover_log_directories(script_path, working_directory=None):
 
 
 def recent_log_files(directories, days_back=DEFAULT_DAYS_BACK, limit=DEFAULT_MAX_FILES,
-                     unlisted=None):
+                     unlisted=None, dropped=None):
     """The newest log files across these directories, inside the day window.
 
     A directory that cannot be listed is warned about and appended to `unlisted`
     when the caller passes a list, so the caller can fail the run: its runs are
-    missing from the series.
+    missing from the series. A log that disappears during the listing, and every
+    log that the `limit` cuts off, is appended to `dropped` for the same reason.
     """
     cutoff = (_utc_now() - timedelta(days=days_back)).timestamp()
     found = []
@@ -772,9 +781,15 @@ def recent_log_files(directories, days_back=DEFAULT_DAYS_BACK, limit=DEFAULT_MAX
             if not path.is_file() or path.suffix.lower() not in LOG_SUFFIXES:
                 continue
             mtime = _mtime(path)
-            if mtime is not None and mtime >= cutoff:
+            if mtime is None:
+                _emit("WARNING: %s vanished during the listing; skipping it" % path)
+                if dropped is not None:
+                    dropped.append(path)
+            elif mtime >= cutoff:
                 found.append((mtime, path))
     found.sort(key=lambda pair: (-pair[0], str(pair[1])))
+    if dropped is not None:
+        dropped.extend(path for _, path in found[limit:])
     return [path for _, path in found[:limit]]
 
 
@@ -870,7 +885,7 @@ def scan_log_file(path, max_lines=DEFAULT_MAX_LINES, rules=(), tail=False, secti
 
 
 def build_rows(paths, rules=(), max_lines=DEFAULT_MAX_LINES, tail=False, sections=False,
-               scheduled=(), slack=DEFAULT_SLACK_MINUTES):
+               scheduled=(), slack=DEFAULT_SLACK_MINUTES, vanished=None):
     """(metric rows, per file summaries) for these log files.
 
     One row per (file, metric). The file's modification time is the
@@ -879,7 +894,8 @@ def build_rows(paths, rules=(), max_lines=DEFAULT_MAX_LINES, tail=False, section
     With scheduled times, a run that started more than slack minutes from
     every one of them is a manual run: it is read and counted, and its rows are
     left out of the series. A run with no timestamp at its start is kept with a
-    warning, because it cannot be told either way.
+    warning, because it cannot be told either way. A log that disappears before
+    it is read is appended to `vanished`, so the caller can fail the run.
     """
     rows = []
     summaries = []
@@ -887,6 +903,8 @@ def build_rows(paths, rules=(), max_lines=DEFAULT_MAX_LINES, tail=False, section
         mtime = _mtime(path)
         if mtime is None:
             _emit("WARNING: %s vanished during the scan; skipping it" % path)
+            if vanished is not None:
+                vanished.append(path)
             continue
         observed = datetime.fromtimestamp(mtime, tz=timezone.utc).isoformat()
         scan = scan_log_file(path, max_lines, rules, tail, sections)
@@ -1758,6 +1776,11 @@ def self_test():
         # yields no rows either way. The summary is what the run counts reports.
         check(gone_summaries == [],
               "and it is not counted as a log file that was read  <-- pinned defect")
+        vanished_paths = []
+        capture(lambda: build_rows([Path(os.path.join(tmp, "nowhere", "gone.log"))],
+                                   vanished=vanished_paths))
+        check(len(vanished_paths) == 1,
+              "a vanished log is handed back to the caller, who exits 3  <-- pinned defect")
 
         # ---- argument parsing
         args = _parse([])
@@ -1852,7 +1875,36 @@ def self_test():
         rc, out, err = capture(lambda: main([str(logdir), "--days", "36500"]))
         check(rc == 0 and "nightly_0501.log" in out, "a wider window reaches the older log")
         rc, out, err = capture(lambda: main([str(logdir), "--days", "36500", "--max-files", "1"]))
-        check(rc == 0 and "nightly_0501.log" not in out, "--max-files keeps the newest only")
+        check(rc == 3 and "nightly_0501.log" not in out and "left out" in err,
+              "--max-files keeps the newest only, and exits 3 because an older run was cut  <-- pinned defect")
+        rc, out, err = capture(lambda: main([str(logdir), "--days", "36500", "--max-files", "2"]))
+        check(rc == 0 and "left out" not in err, "a --max-files that cuts nothing still exits 0")
+        # A log that disappears between the listing and the read cannot be
+        # staged on disk, so the listing function is swapped for one that
+        # returns a path that is not there, then put back.
+        module = sys.modules[__name__]
+        real_listing, real_mtime = module.recent_log_files, module._mtime
+        module.recent_log_files = lambda *a, **k: [Path(os.path.join(tmp, "nowhere", "gone.log"))]
+        try:
+            rc, out, err = capture(lambda: main([str(logdir)]))
+        finally:
+            module.recent_log_files = real_listing
+        check(rc == 3 and "vanished during the scan" in err and "left out" in err,
+              "a log deleted between the listing and the read exits 3, not 0  <-- pinned defect")
+        module._mtime = lambda path: None if path.name == "nightly_0304.log" else real_mtime(path)
+        try:
+            rc, out, err = capture(lambda: main([str(logdir), "--days", "36500"]))
+            skipped = capture(lambda: recent_log_files([logdir], days_back=36500))[0]
+        finally:
+            module._mtime = real_mtime
+        check(rc == 3 and "vanished during the listing" in err and "left out" in err,
+              "a log deleted during the listing is named and exits 3  <-- pinned defect")
+        check(all(path.name != "nightly_0304.log" for path in skipped),
+              "and a caller that passes no list still just skips it")
+        for bad_count in ("0", "-1"):
+            rc, out, err = capture(lambda: main([str(logdir), "--max-files", bad_count]))
+            check(rc == 64 and "--max-files" in err,
+                  "--max-files %s is a usage error, not a silent cut  <-- pinned defect" % bad_count)
         rc, out, err = capture(lambda: main([str(logdir), "--max-lines", "0"]))
         check(rc == 0 and "7.133764" in out,
               "--max-lines 0 reads to the end of the file, it does not read nothing")
@@ -1883,7 +1935,7 @@ def self_test():
                                              "--working-directory", sidecar]))
         check(rc == 0 and "55" in out, "--working-directory mines the sidecar logs")
         rc, out, err = capture(lambda: main(["--script", script, "--working-directory", tmp]))
-        check(rc == 0 and "999" not in out,
+        check(rc == 0 and "shared.log" not in out,
               "and an ancestor working directory contributes nothing  <-- pinned defect")
 
         rules_file = write(os.path.join(tmp, "rules.json"),
@@ -2092,6 +2144,53 @@ def self_test():
         check(redact("run --password --verbose x") == "run --password --verbose x"
               and redact("my-password hunter2") == "my-password hunter2",
               "a flag followed by another flag, and a word that only ends in -password, are left alone")
+        # A value that starts with a dash is still a value. Generated passwords
+        # and tokens often do.
+        for flag_line, secret in (("run.exe --password -Abc123 next", "Abc123"),
+                                  ("run.exe --token -x9 --out y", "-x9"),
+                                  ("connect -Password -9zQ processed 5 rows", "9zQ"),
+                                  ("run.exe --api-key -k3y-v4lue next", "k3y-v4lue")):
+            check(secret not in redact(flag_line) and "REDACTED" in redact(flag_line),
+                  "a flag value that starts with a dash is blanked in %r  <-- pinned defect" % flag_line[:22])
+        check(redact("run.exe --token -x9 --out y") == "run.exe --token REDACTED --out y",
+              "and the flag after it is kept  <-- pinned defect")
+        dash_log = write(os.path.join(tmp, "leak", "dash.log"),
+                         "2026-03-04 03:14:07 - INFO - run.exe --password -Abc123 next "
+                         "Records updated: 4\n")
+        rc, out, err = capture(lambda: main([dash_log, "--format", "csv"]))
+        check(rc == 0 and "abc123" not in out.lower() and "records_updated" in out,
+              "a dash-leading password never reaches metric_key or sample_line  <-- pinned defect")
+        # Authorization in a quoted dict or JSON key, a quoted value, or a scheme
+        # the first rule did not list.
+        for auth_line, secret in (
+                ("headers={'Authorization': 'Basic czNyYzpTM2NyM3RWQUxVRTl6', 'Accept': 'json'} found 500 features",
+                 "czNyYzpTM2NyM3RWQUxVRTl6"),
+                ('{"Authorization": "Basic czNyYzpTM2NyM3RWQUxVRTl6"} found 500 features',
+                 "czNyYzpTM2NyM3RWQUxVRTl6"),
+                ('Authorization: "Basic S3cr3tBLOB9" found 5 features', "S3cr3tBLOB9"),
+                ("Authorization: NTLM TlRMTVNTUAAB found 5 features", "TlRMTVNTUAAB"),
+                ('Authorization: Digest username="svc", response="D1G3STHASH" found 5', "D1G3STHASH"),
+                ("Authorization: S3cr3tONEWORD found 5 features", "S3cr3tONEWORD"),
+                ("Authorization=Basic czNyYzpTM2NyM3RWQUxVRTl6 found 5 features",
+                 "czNyYzpTM2NyM3RWQUxVRTl6")):
+            check(secret not in redact(auth_line) and "REDACTED" in redact(auth_line),
+                  "the credential in %r is blanked  <-- pinned defect" % auth_line[:28])
+        check(redact("Authorization: NTLM TlRMTVNTUAAB found 5 features")
+              == "Authorization: REDACTED found 5 features",
+              "a scheme word and its blob go together, and the count after them stays  <-- pinned defect")
+        # A JSON string inside a JSON string escapes its quotes.
+        check("S3cr3tVALUE9z" not in redact(r'{"msg": "{\"password\": \"S3cr3tVALUE9z\"}", "n": 5}')
+              and "S3cr3tVALUE9z" not in redact(r'{"msg": "{\"token\": \"two S3cr3tVALUE9z\"}"}'),
+              "a secret inside an escaped JSON string is blanked, spaces and all  <-- pinned defect")
+        # ODBC brace quoting, and an AWS access key id with no name= beside it.
+        check("word1" not in redact("Driver={x};PWD={my pass;word1};Database=b found 5 rows")
+              and redact("Driver={x};PWD={my pass;word1};Database=b found 5 rows")
+              == "Driver={x};PWD=REDACTED;Database=b found 5 rows",
+              "a brace quoted ODBC password is blanked whole, and the next name= stays  <-- pinned defect")
+        check(redact("AWS Access Key ID: AKIA1234567890ABCDEF found 5")
+              == "AWS Access Key ID: REDACTED found 5"
+              and redact("AKIA123 AKIAshort found 5") == "AKIA123 AKIAshort found 5",
+              "an AWS access key id is blanked by its shape, and a word that only starts AKIA is not  <-- pinned defect")
         check(redact("api_key=Hunter 2 ok").endswith("REDACTED 2 ok"),
               "an unquoted value ends at the first space, so a second word stays (limit)")
         # An unquoted value runs past a comma, semicolon, bracket or ampersand
@@ -2405,6 +2504,9 @@ def main(argv=None):
     if args.self_test:
         return self_test()
 
+    if args.max_files < 1:
+        _emit("error: --max-files is a number of log files, 1 or more")
+        return 64
     if args.slack < 0:
         _emit("error: --slack is a number of minutes, 0 or more")
         return 64
@@ -2449,7 +2551,9 @@ def main(argv=None):
     # A file named on the command line is read whatever its age: naming it is
     # the instruction. The day window applies to what discovery found.
     unlisted = []
-    files = named_files + recent_log_files(directories, args.days, args.max_files, unlisted)
+    dropped = []
+    files = named_files + recent_log_files(directories, args.days, args.max_files, unlisted,
+                                           dropped)
     if not files and unlisted:
         _emit("ERROR: %d folder(s) could not be listed, so their runs are missing. "
               "Exit 3, not 1." % len(unlisted))
@@ -2459,8 +2563,9 @@ def main(argv=None):
               % (args.days, ", ".join(str(directory) for directory in directories)))
         return 1
 
+    vanished = []
     rows, summaries = build_rows(files, rules, args.max_lines, args.tail, args.sections,
-                                 args.scheduled_at or (), args.slack)
+                                 args.scheduled_at or (), args.slack, vanished)
     text = render(rows, args.format)
 
     written = 0
@@ -2498,7 +2603,12 @@ def main(argv=None):
     if truncated:
         _emit("ERROR: %d log file(s) were cut short by --max-lines, so a total written "
               "last was not read. Use --tail, or --max-lines 0. Exit 3, not 0." % truncated)
-    if unreadable or unlisted or unclassified or truncated:
+    if dropped or vanished:
+        _emit("ERROR: %d log file(s) were left out (more than --max-files %d, or deleted "
+              "during the scan), so their runs are missing from the series. Raise "
+              "--max-files or narrow --days. Exit 3, not 0."
+              % (len(dropped) + len(vanished), args.max_files))
+    if unreadable or unlisted or unclassified or truncated or dropped or vanished:
         return 3
     if not rows:
         _emit("no number in those logs survived the rules. Run with --rules to "
