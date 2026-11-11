@@ -127,9 +127,16 @@ PASS  milliseconds are converted to seconds  <-- pinned defect
 ...
 PASS  ERROR COUNT keeps its first word  <-- pinned defect
 ...
+PASS  'DB_PASSWORD' is blanked  <-- pinned defect
+...
+PASS  TOKX12 from csv never reaches metric_key or display_name  <-- pinned defect
+...
 PASS  no mined row carries the token or the password  <-- pinned defect
 ...
 PASS  one unreadable log among good ones is exit 3, and the good rows still print  <-- pinned defect
+...
+PASS  one unlistable folder among good ones is exit 3, and the good rows still print  <-- pinned defect
+PASS  and an unlistable folder alone is exit 3, not 'nothing to chart'  <-- pinned defect
 ...
 PASS  a csv with a check mark and an arrow reaches a cp1252 stdout as UTF-8, rc 0  <-- pinned defect
 ...
@@ -148,7 +155,7 @@ PASS  a failed run's footer names the count and each failure
 PASS  a harness that missed a deliberate failure is named FATAL, not passed over  <-- pinned defect
 PASS  importing the file runs nothing: main() is defined, not called
 --------------------------------------------------------------------
-387 assertions, 0 failed
+414 assertions, 0 failed
 ```
 
 The block above is an excerpt of a real run; the `...` lines stand for omitted lines, and the
@@ -158,7 +165,7 @@ last line is the real footer.
 
 Python 3.9 or newer. Nothing to install, no `arcpy`, no third-party package, no network and no
 database. It runs on ArcGIS Pro's Python and on a plain `python3` equally. The self-test above
-runs 387 assertions on Windows with Python 3.13, 3.12, 3.10 and 3.9, and 387 on Linux with
+runs 414 assertions on Windows with Python 3.13, 3.12, 3.10 and 3.9, and 414 on Linux with
 Python 3.12. The counts are equal on all five. One label differs by platform:
 `Logs and LOGS are ONE directory where the filesystem folds case` on Windows reads `... are TWO
 directories where it does not` on Linux, because the test asserts what each filesystem does.
@@ -301,8 +308,16 @@ That line is copied into the `sample_line` column of the csv and json. A line th
 can also hold a credential, such as `GET .../query?token=...&f=json found 500 features`, so a
 value after `token`, `password`, `passwd`, `pwd`, `secret`, `api_key`, `key`, `auth` or `sig`
 (with `=` or `:`), after `Authorization:` or `Bearer`, and the password in `scheme://user:pass@`
-is replaced with `REDACTED` first. This is best effort. A secret with no name beside it cannot be
-found.
+is replaced with `REDACTED`. The long names match inside a longer word, so `DB_PASSWORD=`,
+`PGPASSWORD=`, `authToken=` and `x_api_key=` are covered, and a quoted name such as `"token":
+"..."` in json or a Python dict is covered. `key`, `sig` and `auth` must start a word, so
+`primary_key=5` is left alone. The line is blanked before anything is mined from it, so a secret
+cannot reach `metric_key` or `display_name` either. This is best effort. A secret with no name
+beside it cannot be found, and neither can one with a space and no `=` or `:` after its name
+(`password hunter2`). A value with a space in it that is not quoted ends at the space. A command
+line flag such as `--password hunter2` and a `Cookie:` header (`sid=...`) are not covered. The text
+of a key built from words that sit before a number is the log's own text, so a secret written as
+plain words there is not covered.
 
 ```
 $ python logsift.py tok.log --format csv
@@ -371,8 +386,7 @@ function Lines($day, $start, $recs, $dur) {
   "$day $start - INFO - Verification: 3,000 features"
   "$day $start - INFO - Duration: $dur"
 }
-Start-Transcript -Path "$PWD
-ightly_0304.log" | Out-Null
+Start-Transcript -Path "$PWD\nightly_0304.log" | Out-Null
 Lines '2026-03-04' '03:14:00' '1,432' '0:00:07.133764'
 Stop-Transcript | Out-Null
 Lines '2026-03-05' '03:14:00' '1,433' '0:00:08.100000' > nightly_0305.log
@@ -538,8 +552,8 @@ because you named the key yourself. That is how `verification` above gets mined 
 
 ## Exit codes
 
-0 metrics mined, 1 nothing to chart, 2 the write step failed, 3 a log file could not be read,
-64 usage error.
+0 metrics mined, 1 nothing to chart, 2 the write step failed, 3 a log file could not be read or
+a folder could not be listed, 64 usage error.
 
 Exit 1 is the interesting one. It means the tool read log files and no number in them survived
 the rules, or found no log file inside the day window. Both are the failure this tool exists to
@@ -548,7 +562,14 @@ make visible, so neither is reported as success.
 Exit 3 means at least one log file could not be opened, for example because the running job holds
 it locked. The readable files are still mined and printed, stderr names the file, and the run
 exits 3 so a scheduled wrapper does not take a missing run for a complete series. Exit 3 is
-checked before exit 1, so an unreadable file is never blamed on the rules.
+checked before exit 1, so an unreadable file is never blamed on the rules. A folder that cannot
+be listed is the same failure and the same exit: every run in it is missing, so the run exits 3
+even when other folders gave rows, and also when no other folder did.
+
+A log file that is deleted between the listing and the read is skipped with a warning on stderr,
+and the run can still exit 0, so a file rotated away during a scan leaves a gap with no failing
+exit code. A file that opens and then fails during the read, such as a share that drops, ends the
+run with an `OSError` traceback and exit 1, the same code as nothing to chart.
 
 ## Why not Promtail, mtail, or grep
 
@@ -622,8 +643,8 @@ refusing the numbers that are not measurements, and noticing that two spellings 
   ===` or `=== Layer 3 of 12: Roads ===`, is a section header and its value is never mined. Its
   digits also join every key below it (`total_records_updated_99.checked_record_count`), which
   can split one series into several. A metric line wrapped in a banner, such as `*** Records
-  updated: 5 ***`, is eaten the same way. A banner whose first 40 characters hold no letter has
-  an empty section name, and its keys become `.updated_record_count`. A line over 1000
+  updated: 5 ***`, is eaten the same way. A banner whose first 40 characters hold no letter or digit
+  has an empty section name, and its keys become `.updated_record_count`. A line over 1000
   characters is never a banner.
 - With `--scheduled-at`, a log whose first stamp is not `YYYY-MM-DD HH:MM:SS` (for example
   `08/11/2026 10:42:07`, or a time only `10:42:07 INFO ...`) cannot be classified. It is kept with
@@ -640,7 +661,7 @@ refusing the numbers that are not measurements, and noticing that two spellings 
   second, and `Duration: 1.02:03:04` (.NET `TimeSpan`) mines nothing.
 - A number of about 400 digits becomes infinity and prints as `inf` in the table and `Infinity`
   in the json, which is not valid json.
-- `--days` above about 700000 stops with an `OverflowError` traceback. A negative `--max-files`
+- `--days` above about 739000 stops with an `OverflowError` traceback. A negative `--max-files`
   such as `-1` silently drops the oldest file. `--max-files 0` and a negative `--days` both end
   with `no log file in the last N day(s)` and exit 1, and the message does not name the flag.
   `--script` with a path that does not exist and no logs elsewhere says `pass a log file or a
@@ -650,7 +671,9 @@ refusing the numbers that are not measurements, and noticing that two spellings 
 - The data is written to stdout in one call, so a closed pipe such as `| head -1` ends a large
   run with a `BrokenPipeError` traceback and exit 1 after the metrics were mined.
 - In Windows PowerShell 5.1, `>` re-encodes the redirected output as UTF-16LE with a BOM, after
-  decoding logsift's UTF-8 bytes with the console code page, so a non-ASCII character is garbled.
+  decoding logsift's UTF-8 bytes with the console code page, so a non-ASCII character can be
+  garbled. It depends on the console output encoding: with the default code page on one test host
+  a check mark and an arrow came through intact, and with the code page set to CP437 they did not.
   Use `--out FILE --apply` to get UTF-8.
 - The csv guard is the six characters above and nothing more. OWASP also lists a line feed and the
   full-width forms of `=`, `+`, `-` and `@`. A cell cannot start with a line feed that came from a
@@ -666,6 +689,15 @@ refusing the numbers that are not measurements, and noticing that two spellings 
   with catastrophic backtracking, such as `(a+)+$` against the key `aaaaaaaaaaaaaaaaaaaaaaaaaaaaaab`,
   hangs the run. A rules file saved as UTF-8 with a BOM, or as UTF-16 (PowerShell 5.1 `>`), is
   refused with exit 64. The tool sniffs the encoding of logs but not of the rules file.
+- The csv guard tests only the first character. A cell with spaces or tabs before the `=`, such as
+  the `sample_line` `  =1+1`, is not guarded.
+- The table and the json are not guarded, by design. Only the csv is meant to be opened in a
+  spreadsheet. A table pasted into a spreadsheet gets no protection.
+- With `--out FILE --apply`, an incomplete or empty result still overwrites the previous file. An
+  unreadable log gives a csv that lacks that run, and a run whose rows are all filtered out
+  writes a header-only csv and exits 1. Keep a copy of the last good csv.
+- With `--out` and no `--apply`, the run exits 0 and writes no file, so a scheduled command that
+  forgets `--apply` looks successful. stderr says `Nothing written`, and the data goes to stdout.
 - The vocabulary filter is a word list. A job that counts "widgets" needs a rule, and there is no
   way for the tool to guess that one for you.
 

@@ -32,7 +32,7 @@ chart.
 Data goes to stdout as UTF-8, every message goes to stderr, so a redirect gives
 a clean file. Exit codes: 0 metrics mined, 1 nothing to chart (no recent log
 file, or no number in them survived the rules), 2 the write step failed, 3 a log
-file could not be read, 64 usage error.
+file could not be read or a folder could not be listed, 64 usage error.
 """
 
 from __future__ import print_function
@@ -177,18 +177,25 @@ VERB_VALUE_RE = re.compile(
     r"(?:\s+(?P<object>[A-Za-z][A-Za-z0-9 _/-]{0,60}))?"
 )
 
-# sample_line is the log line a number came from, copied into the csv and json.
 # A line that holds a count can also hold a credential ("...?token=...&f=json
-# found 500 features"), so these are blanked first. Best effort, not a promise:
-# a secret with no name beside it cannot be found.
-_SECRET_NAMES = (r"(?:access[_-]?token|refresh[_-]?token|id[_-]?token|token|password|passwd|"
-                 r"pwd|passphrase|secret|client[_-]?secret|api[_-]?key|apikey|auth|key|sig|"
-                 r"signature|credentials?)")
+# found 500 features"), so the line is blanked before anything is mined from it.
+# That keeps a secret out of sample_line and also out of metric_key and
+# display_name, which are built from the text beside the number. Best effort, not
+# a promise: a secret with no name beside it cannot be found. A long name matches
+# inside a word (DB_PASSWORD, PGPASSWORD, authToken, x_api_key). A short one (key,
+# sig, auth) must start a word, so primary_key=5 and monkey=7 are left alone. The
+# name may be quoted, as in JSON and a Python dict, and may end in a word such as
+# _hash or Id.
+_SECRET_NAMES = (r"(?:token|password|passwd|passphrase|secret|credentials?|"
+                 r"(?:api|private|access|signing|encryption|ssh|master)[_-]?key|"
+                 r"\b(?:auth|key|sig|signature|pwd))")
+_SECRET_SUFFIX = r"(?:[_-]?(?:hash|value|string|id|access[_-]?key|key|token|secret))*"
 REDACTIONS = [
     (re.compile(r"(?i)\b(authorization\s*[:=]\s*)(?:(?:bearer|basic|negotiate|token)\s+)?[^\s,;\"']+"),
      r"\1REDACTED"),
     (re.compile(r"(?i)\b(bearer\s+)[A-Za-z0-9._~+/=-]{8,}"), r"\1REDACTED"),
-    (re.compile(r"(?i)\b(" + _SECRET_NAMES + r"\s*[=:]\s*)(?:\"[^\"]*\"|'[^']*'|[^\s&;,)\]\"']+)"),
+    (re.compile(r"(?i)(" + _SECRET_NAMES + _SECRET_SUFFIX + r"[\"']?\s*[=:]\s*)"
+                r"(?:\"[^\"]*\"|'[^']*'|[^\s&;,)\]\"']+)"),
      r"\1REDACTED"),
     (re.compile(r"(?i)\b([a-z][a-z0-9+.-]*://)[^/\s:@]*:[^/\s@]+@"), r"\1REDACTED@"),
 ]
@@ -698,8 +705,14 @@ def discover_log_directories(script_path, working_directory=None):
     return unique_directories(candidates)
 
 
-def recent_log_files(directories, days_back=DEFAULT_DAYS_BACK, limit=DEFAULT_MAX_FILES):
-    """The newest log files across these directories, inside the day window."""
+def recent_log_files(directories, days_back=DEFAULT_DAYS_BACK, limit=DEFAULT_MAX_FILES,
+                     unlisted=None):
+    """The newest log files across these directories, inside the day window.
+
+    A directory that cannot be listed is warned about and appended to `unlisted`
+    when the caller passes a list, so the caller can fail the run: its runs are
+    missing from the series.
+    """
     cutoff = (_utc_now() - timedelta(days=days_back)).timestamp()
     found = []
     for directory in directories:
@@ -707,6 +720,8 @@ def recent_log_files(directories, days_back=DEFAULT_DAYS_BACK, limit=DEFAULT_MAX
             entries = sorted(directory.iterdir())
         except OSError as exc:
             _emit("WARNING: could not list %s: %s" % (directory, exc))
+            if unlisted is not None:
+                unlisted.append(directory)
             continue
         for path in entries:
             if not path.is_file() or path.suffix.lower() not in LOG_SUFFIXES:
@@ -793,10 +808,11 @@ def scan_log_file(path, max_lines=DEFAULT_MAX_LINES, rules=(), tail=False, secti
             if banner is not None:
                 section = banner
             else:
-                for key, value in mine_line(line, rules):
+                safe_line = redact(line)
+                for key, value in mine_line(safe_line, rules):
                     if section is not None:
                         key = section + "." + key
-                    metrics[key] = (value, redact(line)[:240])
+                    metrics[key] = (value, safe_line[:240])
 
     if truncated:
         _emit("WARNING: read only the first %d line(s) of %s; the rest was not mined, so "
@@ -1410,6 +1426,31 @@ def self_test():
             lambda: recent_log_files([Path(os.path.join(tmp, "nowhere"))]))
         check(listed == [], "a directory that cannot be listed is a warning, not a crash")
         check("could not list" in warned, "and the warning names the directory")
+        unlisted_dirs = []
+        capture(lambda: recent_log_files([Path(os.path.join(tmp, "nowhere"))], unlisted=unlisted_dirs))
+        check(len(unlisted_dirs) == 1, "a directory that cannot be listed is handed back to the caller")
+        good_dir = os.path.dirname(write(os.path.join(tmp, "listing", "good", "a.log"),
+                                         "Records updated: 5\n"))
+        bad_dir = os.path.dirname(write(os.path.join(tmp, "listing", "bad", "b.log"),
+                                        "Records updated: 7\n"))
+        real_iterdir = Path.iterdir
+
+        def deny_bad(self):
+            if self.name == "bad":
+                raise PermissionError(13, "Permission denied")
+            return real_iterdir(self)
+
+        Path.iterdir = deny_bad
+        try:
+            rc_listing, out_listing, err_listing = capture(lambda: main([good_dir, bad_dir]))
+            rc_alone, _, err_alone = capture(lambda: main([bad_dir]))
+        finally:
+            Path.iterdir = real_iterdir
+        check(rc_listing == 3 and "updated_record_count" in out_listing
+              and "1 folder(s) could not be listed" in err_listing,
+              "one unlistable folder among good ones is exit 3, and the good rows still print  <-- pinned defect")
+        check(rc_alone == 3 and "no log file" not in err_alone,
+              "and an unlistable folder alone is exit 3, not 'nothing to chart'  <-- pinned defect")
         check(_mtime(Path(os.path.join(tmp, "nowhere", "gone.log"))) is None,
               "a file that is not there has no timestamp")
 
@@ -1938,6 +1979,39 @@ def self_test():
               "a line with no secret is left exactly as it was")
         check(redact("primary_key=5 monkey=7") == "primary_key=5 monkey=7",
               "a word that merely ends in key is not a secret name")
+        # A name with a prefix or a suffix, and a quoted name, are names too.
+        for secret_line, secret in (
+                ("DB_PASSWORD=SECRETVAL1 found 500 features", "SECRETVAL1"),
+                ("ARCGIS_TOKEN=SECRETVAL2 deleted 502 rows", "SECRETVAL2"),
+                ("PGPASSWORD=SECRETVAL3 found 1 rows", "SECRETVAL3"),
+                ("portal_password=SECRETVAL4 found 1 rows", "SECRETVAL4"),
+                ("passwordHash=SECRETVAL5 found 1 rows", "SECRETVAL5"),
+                ("authToken=SECRETVAL6 found 501 records", "SECRETVAL6"),
+                ("x_api_key=SECRETVAL7 found 1 rows", "SECRETVAL7"),
+                ("private_key=SECRETVAL8 found 1 rows", "SECRETVAL8"),
+                ("aws_secret_access_key=SECRETVAL9 found 1 rows", "SECRETVAL9"),
+                ('params={"f": "json", "token": "SECRETVALA"} found 500 features', "SECRETVALA"),
+                ('Response {"access_token":"SECRETVALB"} added 503 rows', "SECRETVALB"),
+                ("{'api_key': 'SECRETVALC'} found 1 rows", "SECRETVALC"),
+                ('{"client_secret": "SECRETVALD"} checked 504 rows', "SECRETVALD"),
+                ('"password": "SECRETVALE", Records checked: 12', "SECRETVALE")):
+            check(secret not in redact(secret_line) and "REDACTED" in redact(secret_line),
+                  "%r is blanked  <-- pinned defect" % secret_line.split("=")[0].split(":")[0][:18])
+        check(redact("api_key=Hunter 2 ok").endswith("REDACTED 2 ok"),
+              "an unquoted value ends at the first space, so a second word stays (limit)")
+        # The text beside a number becomes metric_key and display_name, so a secret
+        # there must go before the key is built, not only from sample_line.
+        for leak_line, secret in (
+                ("2026-03-04 03:14:07 - INFO - token=TOKX1234 Records checked: 12", "TOKX1234"),
+                ("2026-03-04 03:14:07 - INFO - password=Hunter2XY Records checked: 12", "Hunter2XY"),
+                ("2026-03-04 03:14:07 - INFO - Authorization: Bearer abcdef0123456789 "
+                 "Records checked: 1", "abcdef0123456789")):
+            leak_log = write(os.path.join(tmp, "leak", "run.log"), leak_line + "\n")
+            for output_format in ("csv", "json", "table"):
+                rc, out, err = capture(lambda: main([leak_log, "--format", output_format]))
+                check(rc == 0 and secret.lower() not in out.lower() and "checked" in out.lower(),
+                      "%s from %s never reaches metric_key or display_name  <-- pinned defect"
+                      % (secret[:6], output_format))
         secret_log = write(os.path.join(tmp, "secret", "run.log"),
                            "2026-03-04 03:14:07 - INFO - GET https://h/q?token=AAAA1234&f=json found 500 features\n"
                            "2026-03-04 03:14:09 - INFO - password=Hunter2! ; Records checked: 12\n")
@@ -2209,7 +2283,12 @@ def main(argv=None):
 
     # A file named on the command line is read whatever its age: naming it is
     # the instruction. The day window applies to what discovery found.
-    files = named_files + recent_log_files(directories, args.days, args.max_files)
+    unlisted = []
+    files = named_files + recent_log_files(directories, args.days, args.max_files, unlisted)
+    if not files and unlisted:
+        _emit("ERROR: %d folder(s) could not be listed, so their runs are missing. "
+              "Exit 3, not 1." % len(unlisted))
+        return 3
     if not files:
         _emit("no log file in the last %d day(s) under: %s"
               % (args.days, ", ".join(str(directory) for directory in directories)))
@@ -2242,6 +2321,10 @@ def main(argv=None):
     if unreadable:
         _emit("ERROR: %d log file(s) could not be read, so their runs are missing from "
               "the series. Exit 3, not 0 or 1." % unreadable)
+    if unlisted:
+        _emit("ERROR: %d folder(s) could not be listed, so their runs are missing from "
+              "the series. Exit 3, not 0 or 1." % len(unlisted))
+    if unreadable or unlisted:
         return 3
     if not rows:
         _emit("no number in those logs survived the rules. Run with --rules to "
