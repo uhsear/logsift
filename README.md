@@ -45,6 +45,7 @@ PASS  '2026-03-04 03:14:07 | INFO |' mines exactly one pair, seven seconds  <-- 
 ...
 PASS  '[2026-03-04 03:14:07]' mines exactly one pair, seven seconds  <-- pinned defect
 ...
+PASS  an ISO stamp with Z is preamble, not part of the metric key  <-- pinned defect
 PASS  a logger's module field does not become part of the key
 PASS  stripping the preamble does not swallow the payload  <-- pinned defect
 PASS  a start time really does mine the year as a number  <-- pinned defect
@@ -147,6 +148,9 @@ PASS  a text cell with a carriage return inside it stays one cell of one row, on
 PASS  a log file named @job.log and lines that start with - or @ reach the csv guarded  <-- pinned defect
 PASS  and the file --apply writes carries the same guard  <-- pinned defect
 ...
+PASS  the value of the flag in '--password hunter2' is blanked  <-- pinned defect
+PASS  a folder the account cannot traverse is exit 3, not a PermissionError traceback  <-- pinned defect
+PASS  a secret in a banner never reaches a key under --sections, in csv  <-- pinned defect
 PASS  main warns when the line limit cut a log short  <-- pinned defect
 ...
 PASS  check() and raises() really do record a failure  <-- pinned defect
@@ -155,7 +159,7 @@ PASS  a failed run's footer names the count and each failure
 PASS  a harness that missed a deliberate failure is named FATAL, not passed over  <-- pinned defect
 PASS  importing the file runs nothing: main() is defined, not called
 --------------------------------------------------------------------
-414 assertions, 0 failed
+432 assertions, 0 failed
 ```
 
 The block above is an excerpt of a real run; the `...` lines stand for omitted lines, and the
@@ -165,11 +169,11 @@ last line is the real footer.
 
 Python 3.9 or newer. Nothing to install, no `arcpy`, no third-party package, no network and no
 database. It runs on ArcGIS Pro's Python and on a plain `python3` equally. The self-test above
-runs 414 assertions on Windows with Python 3.13, 3.12, 3.10 and 3.9, and 414 on Linux with
+runs 432 assertions on Windows with Python 3.13, 3.12, 3.10 and 3.9, and 432 on Linux with
 Python 3.12. The counts are equal on all five. One label differs by platform:
 `Logs and LOGS are ONE directory where the filesystem folds case` on Windows reads `... are TWO
 directories where it does not` on Linux, because the test asserts what each filesystem does.
-Branch coverage of `logsift.py` is 100 percent (1101 statements, 240 branches), measured with
+Branch coverage of `logsift.py` is 100 percent (1168 statements, 264 branches), measured with
 `python -m coverage run --branch logsift.py --self-test`. `pyflakes` is clean, and the file
 compiles with `python -W error`.
 
@@ -315,7 +319,12 @@ is replaced with `REDACTED`. The long names match inside a longer word, so `DB_P
 cannot reach `metric_key` or `display_name` either. This is best effort. A secret with no name
 beside it cannot be found, and neither can one with a space and no `=` or `:` after its name
 (`password hunter2`). A value with a space in it that is not quoted ends at the space. A command
-line flag such as `--password hunter2` and a `Cookie:` header (`sid=...`) are not covered. The text
+line flag with a space before its value, such as `--password hunter2` or the PowerShell form
+`-Password hunter2`, is covered, and so is the same flag with a quoted value. A `Cookie:` header
+(`sid=...`) is not covered. The name list is fixed: `pass=`, `pat=`, `AccountKey=` and a
+URL-encoded name such as `token%3Dabc` are not recognised, and `token=abc,def` leaves `,def`
+visible because an unquoted value stops at the comma. A banner under `--sections` is blanked the
+same way, before it names a section. The text
 of a key built from words that sit before a number is the log's own text, so a secret written as
 plain words there is not covered.
 
@@ -553,7 +562,8 @@ because you named the key yourself. That is how `verification` above gets mined 
 ## Exit codes
 
 0 metrics mined, 1 nothing to chart, 2 the write step failed, 3 a log file could not be read or
-a folder could not be listed, 64 usage error.
+a folder could not be listed, 64 usage error. Every usage error exits 64, including one that
+the argument parser raises, such as an unknown flag or `--days x`.
 
 Exit 1 is the interesting one. It means the tool read log files and no number in them survived
 the rules, or found no log file inside the day window. Both are the failure this tool exists to
@@ -689,8 +699,37 @@ refusing the numbers that are not measurements, and noticing that two spellings 
   with catastrophic backtracking, such as `(a+)+$` against the key `aaaaaaaaaaaaaaaaaaaaaaaaaaaaaab`,
   hangs the run. A rules file saved as UTF-8 with a BOM, or as UTF-16 (PowerShell 5.1 `>`), is
   refused with exit 64. The tool sniffs the encoding of logs but not of the rules file.
-- The csv guard tests only the first character. A cell with spaces or tabs before the `=`, such as
-  the `sample_line` `  =1+1`, is not guarded.
+- The csv guard tests only the first character. Every log line is stripped before it becomes a
+  `sample_line`, so that column never starts with a space and the guard sees its first sign. The
+  `log_file` column is the one that can start with spaces, because a file name on Linux may. A name
+  such as `  =1+1.log` is not guarded.
+- A log file name is never redacted. It goes to stdout, to the csv and json, and to stderr as it
+  is, so a secret placed in a file name is printed. A control character or an ANSI escape in a
+  file name is printed raw in the table and on stderr, and only the csv guards the first character.
+- `| head -1` ends the run with a `BrokenPipeError` traceback and exit 1, the same code as
+  `nothing to chart`, so exit 1 is ambiguous when the output goes through a pipe that can close.
+- Exit 0 does not mean every file was read to the end. The default `--max-lines 5000` without
+  `--tail` reads only the first 5000 lines, so a total written last is replaced by an early
+  value. The only signal is a warning on stderr, which an unattended run does not read.
+- A line whose only number is an HTTP status in an error line, such as `Error: 404 Not Found`, is
+  charted as the metric `error = 404`. The tool refuses a number that was never a measurement
+  only by label, not by meaning.
+- `Elapsed: 00:01:07` mines nothing, because `elapsed` alone is not in the list of duration
+  labels. `Elapsed time:` is. This is a missed value, not a wrong one.
+- A sentence count keeps the words after the number in its key, and a total in those words changes
+  the key: `Processed 500 of 10000 records` is `processed_of_10000_records`, a new series when the
+  total changes.
+- A log file that is deleted between the folder listing and the modification time check is dropped with no
+  warning. Only a failure of the later read is warned about.
+- When `--scheduled-at` removes every row as a manual run, the message `no number in those logs
+  survived the rules` names the wrong cause. Exit 1 is still right. Read the line `manual run(s)
+  left out of the series` above it.
+- A path named beneath a folder the account may not enter is reported as `no such file or
+  directory` with exit 64, not as exit 3, because the operating system answers the same way for
+  both. A folder found through `--script` or `--working-directory`, or a named folder that is
+  itself unreadable, exits 3.
+- `--apply` with no `--out` writes no file and says nothing. The data goes to stdout and the run
+  exits 0, so a scheduled task that forgets `--out` looks successful.
 - The table and the json are not guarded, by design. Only the csv is meant to be opened in a
   spreadsheet. A table pasted into a spreadsheet gets no protection.
 - With `--out FILE --apply`, an incomplete or empty result still overwrites the previous file. An
@@ -703,7 +742,8 @@ refusing the numbers that are not measurements, and noticing that two spellings 
 
 ## Name
 
-Other GitHub repositories are called `logsift`, among others: command line filters and
+This list of same-named repositories was read from a GitHub search on 2026-11-11 and changes
+over time. Other GitHub repositories are called `logsift`, among others: command line filters and
 summarisers for access logs, severity levels and JSONL, an MCP log-noise tool, an LLM prompt
 builder, a Java toolkit and a streaming anomaly detector. This one mines metrics from a scheduled
 job's log files. It does not share code with any of them.

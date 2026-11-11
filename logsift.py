@@ -127,9 +127,15 @@ SECTION_LINE_MAX = 1000
 # 2" is a label, and stripping its first word would leave the key "count" and
 # merge two unrelated metrics. "ERRORS: 4" is not the level "ERROR" either.
 _LEVELS = r"(?:DEBUG|INFO|WARNING|WARN|ERROR|CRITICAL)"
+_STAMP = (r"(?:\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:[.,]\d+)?(?:Z|[+-]\d{2}:?\d{2})?"
+          r"|\d{2}/\d{2}/\d{4} \d{2}:\d{2}:\d{2}(?:[.,]\d+)?(?: ?[AP]M)?)")
+# A stamp is ISO 8601 with an optional Z or offset, or US month/day/year. A
+# logger name ("parcels.update - INFO -") may sit between the stamp and the
+# level, and is dropped only when a level word follows it.
 LOG_PREAMBLE_RE = re.compile(
-    r"^\s*(?P<ts>\[?\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:[.,]\d+)?\]?)?"
+    r"^\s*(?P<ts>\[?" + _STAMP + r"\]?)?"
     r"\s*(?:[-|:]\s*)?"
+    r"(?(ts)(?:[A-Za-z_][\w.]*\s*[-|]\s*(?=\[?" + _LEVELS + r"(?![A-Za-z0-9_])\]?\s*[-|:]))?)"
     r"(?:\[" + _LEVELS + r"\]"
     r"|" + _LEVELS + r"(?![A-Za-z0-9_])(?=\s*[-|:])"
     r"|(?(ts)" + _LEVELS + r"(?![A-Za-z0-9_])))?"
@@ -197,6 +203,8 @@ REDACTIONS = [
     (re.compile(r"(?i)(" + _SECRET_NAMES + _SECRET_SUFFIX + r"[\"']?\s*[=:]\s*)"
                 r"(?:\"[^\"]*\"|'[^']*'|[^\s&;,)\]\"']+)"),
      r"\1REDACTED"),
+    (re.compile(r"(?i)(?<!\S)(--?" + _SECRET_NAMES + _SECRET_SUFFIX + r"\s+)"
+                r"(?:\"[^\"]*\"|'[^']*'|[^\s-][^\s]*)"), r"\1REDACTED"),
     (re.compile(r"(?i)\b([a-z][a-z0-9+.-]*://)[^/\s:@]*:[^/\s@]+@"), r"\1REDACTED@"),
 ]
 
@@ -658,9 +666,15 @@ def unique_directories(paths):
     result = []
     seen = set()
     for path in paths:
-        if not path.is_dir():
-            continue
-        key = os.path.normcase(str(path.resolve()))
+        try:
+            if not path.is_dir():
+                continue
+            key = os.path.normcase(str(path.resolve()))
+        except OSError:
+            # A folder the account may not traverse cannot even be stat-ed.
+            # Keep it, so the listing step reports it and the run exits 3
+            # instead of crashing.
+            key = os.path.normcase(str(path))
         if key not in seen:
             seen.add(key)
             result.append(path)
@@ -804,7 +818,7 @@ def scan_log_file(path, max_lines=DEFAULT_MAX_LINES, rules=(), tail=False, secti
 
             # A banner is a title, not a measurement: it opens a section and is
             # not mined itself.
-            banner = section_name(line) if sections else None
+            banner = section_name(redact(line)) if sections else None
             if banner is not None:
                 section = banner
             else:
@@ -1012,6 +1026,17 @@ def self_test():
         check(not [key for key, _ in extract_metrics_from_line(line) if key.startswith("info_")],
               "%r never mines an info_ key  <-- pinned defect" % preamble.strip())
 
+    for shape, preamble in (("a logger name before the level", "2026-03-04 03:14:07,123 - parcels.update - INFO - "),
+                            ("an ISO stamp with Z", "2026-03-04T03:14:07Z INFO - "),
+                            ("an ISO stamp with an offset", "2026-03-04T03:14:07+00:00 INFO - "),
+                            ("a US month/day/year stamp", "03/04/2026 03:14:07 INFO - "),
+                            ("a US stamp with AM", "03/04/2026 03:14:07 AM INFO - "),
+                            ("a bracketed level after a logger", "2026-03-04 03:14:07 | parcels | [WARNING] ")):
+        check(mine_line(preamble + "Records updated: 5") == [("updated_record_count", 5.0)],
+              "%s is preamble, not part of the metric key  <-- pinned defect" % shape)
+    check(mine_line("2026-03-04 03:14:07 - parcels.update - Records updated: 5")
+          == [("update_records_updated", 5.0)],
+          "a logger name with no level word after it is left alone (limit)")
     check(mine_line("2026-03-04 17:45:13,116 - INFO - Duration: 0:00:07.133764")
           == [("duration_seconds", 7.133764)],
           "a comma separated millisecond stamp is preamble, not a metric")
@@ -1714,13 +1739,13 @@ def self_test():
             _, _, _ = capture(lambda: _parse(["--format", "yaml"]))
         except SystemExit as exc:
             code = exc.code
-        check(code == 2, "an unknown format is a usage error, not a crash")
+        check(code == 64, "an unknown format is a usage error, not a crash")
         try:
             code = None
             _, _, _ = capture(lambda: _parse(["--ap"]))
         except SystemExit as exc:
             code = exc.code
-        check(code == 2, "a unique prefix of --apply is refused, not read as --apply  <-- pinned defect")
+        check(code == 64, "a unique prefix of --apply is refused, not read as --apply  <-- pinned defect")
         args = _parse([])
         check(args.tail is False and args.sections is False and args.scheduled_at is None
               and args.slack == 30,
@@ -1738,7 +1763,7 @@ def self_test():
                 _, _, err = capture(lambda: _parse(bad_argv))
             except SystemExit as exc:
                 code = exc.code
-            check(code == 2, "%s is a usage error" % label)
+            check(code == 64, "%s is a usage error" % label)
 
         # ---- main, end to end
         rc, out, err = capture(lambda: main([]))
@@ -1997,6 +2022,16 @@ def self_test():
                 ('"password": "SECRETVALE", Records checked: 12', "SECRETVALE")):
             check(secret not in redact(secret_line) and "REDACTED" in redact(secret_line),
                   "%r is blanked  <-- pinned defect" % secret_line.split("=")[0].split(":")[0][:18])
+        for flag_line, secret in (("Records updated: 4 --password hunter2", "hunter2"),
+                                  ("Records updated: 4 -Password hunter2", "hunter2"),
+                                  ("Records updated: 4 --api-key abc123xyz", "abc123xyz"),
+                                  ('Records updated: 4 --token "two words"', "two words"),
+                                  ("Records updated: 4 --secret 'a b'", "a b")):
+            check(secret not in redact(flag_line) and "REDACTED" in redact(flag_line),
+                  "the value of the flag in %r is blanked  <-- pinned defect" % flag_line[19:])
+        check(redact("run --password --verbose x") == "run --password --verbose x"
+              and redact("my-password hunter2") == "my-password hunter2",
+              "a flag followed by another flag, and a word that only ends in -password, are left alone")
         check(redact("api_key=Hunter 2 ok").endswith("REDACTED 2 ok"),
               "an unquoted value ends at the first space, so a second word stays (limit)")
         # The text beside a number becomes metric_key and display_name, so a secret
@@ -2060,6 +2095,39 @@ def self_test():
         check(locked_summaries[0]["unreadable"] and "no timestamp" not in locked_err,
               "and it is not also called a log with no timestamp")
         check(summaries[0]["unreadable"] is False, "a log that was read is not marked unreadable")
+
+        # A folder the account may not traverse is exit 3, not a traceback.
+        real_is_dir = Path.is_dir
+
+        def deny_probe(self):
+            if self.name == "locked_probe":
+                raise PermissionError(13, "Permission denied")
+            return real_is_dir(self)
+
+        probe_script = os.path.join(tmp, "locked_probe", "job.py")
+        Path.is_dir = deny_probe
+        try:
+            kept = unique_directories([Path(tmp) / "locked_probe"])
+            rc, out, err = capture(lambda: main(["--script", probe_script, "--days", "36500"]))
+        finally:
+            Path.is_dir = real_is_dir
+        check(len(kept) == 1 and kept[0].name == "locked_probe",
+              "a folder that cannot be stat-ed is kept, so the listing step can report it  <-- pinned defect")
+        check(rc == 3 and "could not list" in err and "Traceback" not in err,
+              "a folder the account cannot traverse is exit 3, not a PermissionError traceback  <-- pinned defect")
+
+        # A banner is redacted before it names a section, so it cannot leak into a key.
+        banner_log = write(os.path.join(tmp, "banner", "run.log"),
+                           "2026-03-04 03:14:07 - INFO - === token=AAAA1234secret ===\n"
+                           "2026-03-04 03:14:08 - INFO - Records updated: 5\n"
+                           "### password: hunter2 ###\n"
+                           "Records checked: 9\n")
+        for output_format in ("csv", "json", "table"):
+            rc, out, err = capture(lambda: main([banner_log, "--sections", "--format", output_format]))
+            check(rc == 0 and "aaaa1234secret" not in out.lower() and "hunter2" not in out.lower()
+                  and "checked_record_count" in out,
+                  "a secret in a banner never reaches a key under --sections, in %s  <-- pinned defect"
+                  % output_format)
 
         # stdout is UTF-8 bytes, not the redirect's code page.
         arrow = write(os.path.join(tmp, "uni", "arrow.log"),
@@ -2179,8 +2247,17 @@ def _clock_arg(text):
         raise argparse.ArgumentTypeError(str(exc))
 
 
+class _Parser(argparse.ArgumentParser):
+    """A usage error exits 64, not argparse's 2, which this tool means as "the
+    write step failed"."""
+
+    def error(self, message):
+        self.print_usage(sys.stderr)
+        self.exit(64, "%s: error: %s\n" % (self.prog, message))
+
+
 def _parse(argv):
-    parser = argparse.ArgumentParser(
+    parser = _Parser(
         prog="logsift.py",
         allow_abbrev=False,
         description="Mine a job's own log files into a metric series, and "
