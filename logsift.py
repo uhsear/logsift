@@ -547,6 +547,21 @@ def format_value(value):
     return "%s" % number
 
 
+def cell(value):
+    """A csv text cell that a spreadsheet will not run as a formula.
+
+    A cell that starts with =, +, -, @, a tab or a carriage return gets one
+    leading apostrophe. Only text goes through here: metric_value is a number,
+    and a negative one must stay "-5", so render never passes it in. This tool
+    never reads its own csv back, so there is no matching strip. A consumer
+    that wants the original text removes exactly one leading apostrophe.
+    """
+    value = str(value)
+    if value[:1] in tuple("=+-@" + chr(9) + chr(13)):
+        return "'" + value
+    return value
+
+
 def render(rows, fmt="table"):
     """The metric series as text. Pure: no file, no clock, no environment."""
     if fmt == "json":
@@ -555,10 +570,16 @@ def render(rows, fmt="table"):
     if fmt == "csv":
         buf = io.StringIO()
         writer = csv.writer(buf, lineterminator="\n")
+        # Python before 3.11 does not quote a field with a lone CR in it when the
+        # line terminator is LF, so a reader would end the row there and read
+        # the rest as a new row, past the guard in cell(). Quote such a row whole.
+        quoted = csv.writer(buf, lineterminator="\n", quoting=csv.QUOTE_ALL)
         writer.writerow(ROW_FIELDS)
         for row in rows:
-            writer.writerow([format_value(row[field]) if field == "metric_value"
-                             else row[field] for field in ROW_FIELDS])
+            fields = [format_value(row[field]) if field == "metric_value"
+                      else cell(row[field]) for field in ROW_FIELDS]
+            breaks = any("\r" in field or "\n" in field for field in fields)
+            (quoted if breaks else writer).writerow(fields)
         return buf.getvalue()
 
     columns = ("metric_key", "metric_value", "observed_at_utc", "log_file")
@@ -1166,6 +1187,53 @@ def self_test():
     check(json.loads(render(sample, "json")) == sample, "the json round-trips every field")
     check(",1432," in body, "the csv carries 1432, not 1432.0")
 
+    # ---- csv formula injection: a text cell from a log or a file name is data
+    # to a spreadsheet only if it does not start with a formula character.
+    # metric_value is a number and is never guarded.
+    text_fields = [field for field in ROW_FIELDS if field != "metric_value"]
+    check(text_fields == ["metric_key", "display_name", "observed_at_utc", "log_file",
+                          "sample_line"],
+          "five csv columns are text and one is a number, so every text column is tested below")
+    for field in text_fields:
+        for lead, name in (("=", "="), ("+", "+"), ("-", "-"), ("@", "@"),
+                           (chr(9), "a tab"), (chr(13), "a carriage return")):
+            hostile = dict(sample[0])
+            hostile[field] = lead + "SUM(A1:A9)"
+            cells = list(csv.reader(io.StringIO(render([hostile], "csv"), newline="")))
+            check(len(cells) == 2 and cells[1][ROW_FIELDS.index(field)] == "'" + lead + "SUM(A1:A9)",
+                  "the %s cell starting with %s gets a leading apostrophe  <-- pinned defect"
+                  % (field, name))
+    check(cell("=1+1") == "'=1+1" and cell("") == "" and cell("a=b") == "a=b"
+          and cell("x-y") == "x-y" and cell("'=1") == "'=1" and cell(12) == "12",
+          "a cell with a formula character inside it, an empty cell and a number are left as they were")
+    negative = dict(sample[0], metric_value=-5.0)
+    fraction = dict(sample[1], metric_value=-0.25)
+    cells = list(csv.reader(io.StringIO(render([negative, fraction], "csv"))))
+    check([row[2] for row in cells[1:]] == ["-5", "-0.25"]
+          and [float(row[2]) for row in cells[1:]] == [-5.0, -0.25],
+          "a negative metric_value stays a number, with no apostrophe  <-- pinned defect")
+    # Python 3.9 and 3.10 leave a lone CR unquoted under an LF terminator, so
+    # "ok" CR "=1+1" read back as two rows and the second began with a bare "=".
+    for middle, name in (("ok" + chr(13) + "=1+1", "a carriage return"),
+                         ("ok" + chr(10) + "=1+1", "a line feed"),
+                         ("ok" + chr(13) + chr(10) + "=1+1", "a CRLF")):
+        broken = dict(sample[0], log_file=middle, sample_line=chr(13) + "tail")
+        body_break = render([broken], "csv")
+        cells = list(csv.reader(io.StringIO(body_break, newline="")))
+        check(len(cells) == 2 and cells[1][4] == middle and cells[1][5] == "'" + chr(13) + "tail"
+              and cells[1][2] == "7.133764",
+              "a text cell with %s inside it stays one cell of one row, on every Python  "
+              "<-- pinned defect" % name)
+    check(render([sample[0]], "csv").splitlines()[0] == ",".join(ROW_FIELDS)
+          and render([sample[0]], "csv").splitlines()[1].count('"') == 2,
+          "and a row with no line break in it is quoted exactly as before")
+    check(all(cell(lead + "x")[1:] == lead + "x" and cell(lead + "x")[0] == "'"
+              for lead in ("=", "+", "-", "@", chr(9), chr(13))),
+          "removing exactly one leading apostrophe restores the original text")
+    hostile_json = dict(sample[0], sample_line="=1+1")
+    check(json.loads(render([hostile_json], "json"))[0]["sample_line"] == "=1+1",
+          "the json carries the text as it was: only the csv is opened in a spreadsheet")
+
     # ---- encoding sniffing
     text = "2026-03-04 03:14:07 - INFO - Records updated: 5\r\n"
     check(sniff_encoding(text.encode("utf-8")) == ("utf-8", 0, 1),
@@ -1768,6 +1836,33 @@ def self_test():
                                              os.path.join(tmp, "nowhere", "x.csv"), "--apply"]))
         check(rc == 2 and "could not write" in err,
               "a write that fails is exit 2, not a false success")
+
+        # ---- the pinned defect: a hostile log line and file name through main, csv
+        hostile_dir = os.path.join(tmp, "hostile")
+        write(os.path.join(hostile_dir, "@job.log"), "-- Records updated: 5\n")
+        write(os.path.join(hostile_dir, "=job.log"), "+ Records updated: -7\n"
+              "@ Records checked: 3\n")
+        rc, out, err = capture(lambda: main([hostile_dir, "--format", "csv"]))
+        hostile_rows = list(csv.reader(io.StringIO(out)))
+        by_file = dict(((row[4], row[0]), row) for row in hostile_rows[1:])
+        check(rc == 0 and len(hostile_rows) == 4
+              and by_file[("'@job.log", "updated_record_count")][5] == "'-- Records updated: 5"
+              and by_file[("'=job.log", "checked_record_count")][5] == "'@ Records checked: 3",
+              "a log file named @job.log and lines that start with - or @ reach the csv guarded  <-- pinned defect")
+        check(by_file[("'=job.log", "updated_record_count")][2] == "-7"
+              and by_file[("'=job.log", "updated_record_count")][5] == "'+ Records updated: -7",
+              "while a negative count in the same file is still the bare number -7  <-- pinned defect")
+        hostile_out = os.path.join(tmp, "hostile.csv")
+        rc, out, err = capture(lambda: main([hostile_dir, "--format", "csv", "--out", hostile_out]))
+        check(rc == 0 and not os.path.exists(hostile_out),
+              "a hostile csv is not written without --apply either")
+        rc, out, err = capture(lambda: main([hostile_dir, "--format", "csv",
+                                             "--out", hostile_out, "--apply"]))
+        with open(hostile_out, "rb") as handle:
+            hostile_file = list(csv.reader(io.StringIO(handle.read().decode("utf-8"))))
+        check(rc == 0 and len(hostile_file) == 4
+              and all(row[4][0] == "'" and row[5][0] == "'" for row in hostile_file[1:]),
+              "and the file --apply writes carries the same guard  <-- pinned defect")
 
         # ---- the audit round: each case below reached a chart or crashed a run
         started_at = datetime.now()

@@ -133,6 +133,13 @@ PASS  one unreadable log among good ones is exit 3, and the good rows still prin
 ...
 PASS  a csv with a check mark and an arrow reaches a cp1252 stdout as UTF-8, rc 0  <-- pinned defect
 ...
+PASS  the sample_line cell starting with = gets a leading apostrophe  <-- pinned defect
+PASS  the log_file cell starting with a carriage return gets a leading apostrophe  <-- pinned defect
+PASS  a negative metric_value stays a number, with no apostrophe  <-- pinned defect
+PASS  a text cell with a carriage return inside it stays one cell of one row, on every Python  <-- pinned defect
+PASS  a log file named @job.log and lines that start with - or @ reach the csv guarded  <-- pinned defect
+PASS  and the file --apply writes carries the same guard  <-- pinned defect
+...
 PASS  main warns when the line limit cut a log short  <-- pinned defect
 ...
 PASS  check() and raises() really do record a failure  <-- pinned defect
@@ -141,7 +148,7 @@ PASS  a failed run's footer names the count and each failure
 PASS  a harness that missed a deliberate failure is named FATAL, not passed over  <-- pinned defect
 PASS  importing the file runs nothing: main() is defined, not called
 --------------------------------------------------------------------
-344 assertions, 0 failed
+387 assertions, 0 failed
 ```
 
 The block above is an excerpt of a real run; the `...` lines stand for omitted lines, and the
@@ -151,11 +158,11 @@ last line is the real footer.
 
 Python 3.9 or newer. Nothing to install, no `arcpy`, no third-party package, no network and no
 database. It runs on ArcGIS Pro's Python and on a plain `python3` equally. The self-test above
-runs 344 assertions on Windows with Python 3.13, 344 on Windows with Python 3.9 and 344 on
-Linux with Python 3.12. The counts are equal on all three. One label differs by platform:
+runs 387 assertions on Windows with Python 3.13, 3.12, 3.10 and 3.9, and 387 on Linux with
+Python 3.12. The counts are equal on all five. One label differs by platform:
 `Logs and LOGS are ONE directory where the filesystem folds case` on Windows reads `... are TWO
 directories where it does not` on Linux, because the test asserts what each filesystem does.
-Branch coverage of `logsift.py` is 100 percent (1056 statements, 232 branches), measured with
+Branch coverage of `logsift.py` is 100 percent (1101 statements, 240 branches), measured with
 `python -m coverage run --branch logsift.py --self-test`. `pyflakes` is clean, and the file
 compiles with `python -W error`.
 
@@ -301,6 +308,38 @@ found.
 $ python logsift.py tok.log --format csv
 found_features,Found Features,500,...,tok.log,2026-09-17 03:14:03 - INFO - GET https://host/q?token=REDACTED&f=json found 500 features
 ```
+
+## CSV and spreadsheets
+
+A log line and a log file name are text that somebody else wrote, and the csv is meant to be
+opened in a spreadsheet. A spreadsheet reads a cell that starts with `=`, `+`, `-`, `@`, a tab or
+a carriage return as a formula
+([OWASP, CSV Injection](https://owasp.org/www-community/attacks/CSV_Injection)). So in the csv,
+every text cell that starts with one of those six characters gets one leading apostrophe. The
+text columns are `metric_key`, `display_name`, `observed_at_utc`, `log_file` and `sample_line`.
+`metric_value` is a number and is never changed, so a negative count stays `-7`.
+
+A file named `@job.log` that holds the lines `-- Records updated: 5` and `+ Records checked: -7`
+gives this csv. The real command and its real output, with the time column shortened:
+
+```
+$ python logsift.py @job.log --format csv
+metric_key,display_name,metric_value,observed_at_utc,log_file,sample_line
+checked_record_count,Checked Record Count,-7,<time>,'@job.log,'+ Records checked: -7
+updated_record_count,Updated Record Count,5,<time>,'@job.log,'-- Records updated: 5
+```
+
+The guard covers the file that `--out FILE --apply` writes, because both come from the same
+function. `--format json` and the table are not changed: neither one is opened in a spreadsheet.
+This tool never reads its own csv back. A program that reads it removes exactly one leading
+apostrophe from a text cell that starts with one.
+
+A cell that holds a line break is a second risk. Python 3.9 and 3.10 do not quote a lone carriage
+return when the line terminator is LF, so a reader ends the row there and the rest of the cell
+becomes a new row that starts with whatever followed the break, past the guard. A row with a CR
+or an LF in any cell is therefore written with every field quoted. Python 3.12 and 3.13 quote
+such a field by themselves. The self-test pins the behaviour on every Python it runs under
+(Requirements lists where it was run).
 
 ## Log encodings
 
@@ -613,8 +652,16 @@ refusing the numbers that are not measurements, and noticing that two spellings 
 - In Windows PowerShell 5.1, `>` re-encodes the redirected output as UTF-16LE with a BOM, after
   decoding logsift's UTF-8 bytes with the console code page, so a non-ASCII character is garbled.
   Use `--out FILE --apply` to get UTF-8.
-- A `sample_line` that starts with `=`, `+`, `-` or `@` is not escaped, so a spreadsheet may read
-  it as a formula. Treat the csv as untrusted if the logs are.
+- The csv guard is the six characters above and nothing more. OWASP also lists a line feed and the
+  full-width forms of `=`, `+`, `-` and `@`. A cell cannot start with a line feed that came from a
+  log line, because lines are split there. A log file name that starts with a line feed, or with a
+  full-width sign, is not guarded. OWASP also warns that its prefix advice is "not reliable in
+  Microsoft Excel after saving and re-opening the CSV file". Treat a csv built from logs you do
+  not control as untrusted, and open it as text, not by double click.
+- The apostrophe is visible. A cell whose real text already begins with `'` and then a formula
+  character is not changed, and a consumer cannot tell it from a cell that was guarded. A text
+  cell that starts with `=`, `+`, `-` or `@` and was meant to be literal, such as the
+  `sample_line` `-- Records updated: 5`, shows a leading `'` in a program that does not strip it.
 - `--rules` patterns are ordinary Python regular expressions from a file you supply. A pattern
   with catastrophic backtracking, such as `(a+)+$` against the key `aaaaaaaaaaaaaaaaaaaaaaaaaaaaaab`,
   hangs the run. A rules file saved as UTF-8 with a BOM, or as UTF-16 (PowerShell 5.1 `>`), is
@@ -644,6 +691,15 @@ Behaviour this tool relies on, and where it was checked:
   `FF FE`: [Unicode FAQ, UTF and BOM](https://www.unicode.org/faq/utf_bom.html).
 - Python `logging` writes `asctime` as `2003-07-08 16:49:45,896` in local time by default:
   [logging](https://docs.python.org/3.12/library/logging.html).
+- A spreadsheet runs a cell that starts with `=`, `+`, `-`, `@`, a tab or a carriage return as a
+  formula, and a leading single quote is one of the listed mitigations, with the Excel
+  re-opening caveat quoted in Limits:
+  [OWASP, CSV Injection](https://owasp.org/www-community/attacks/CSV_Injection).
+  Read on 2026-11-11. The page lists a line feed and full-width signs as well, which this tool
+  does not guard.
+- Python 3.9.25 and 3.10.20 leave a lone carriage return unquoted under an LF line terminator,
+  and 3.12 and 3.13 quote it. This was measured, not read: with the whole-row quoting removed,
+  the self-test fails on 3.9.25 and 3.10.20 and passes on 3.12 and 3.13.
 
 No Esri, SQL Server or Census behaviour is used.
 
