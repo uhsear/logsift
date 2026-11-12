@@ -166,7 +166,7 @@ _UNITS = r"milliseconds?|msecs?|ms|seconds?|secs?|s|minutes?|mins?|m|hours?|hrs?
 # module field in "ts | INFO | update_parcels | Records checked: 12000" is left
 # out of the key.
 LABEL_VALUE_RE = re.compile(
-    r"(?P<label>[A-Za-z][A-Za-z0-9 /()_-]{2,80}?)\s*:\s*(?P<value>-?\d[\d,]*(?:\.\d+)?)"
+    r"(?P<label>[A-Za-z][A-Za-z0-9 /()_-]{2,80}?)\s*:\s*(?P<value>-?\d[\d,]*(?:\.\d+)?(?:[eE][+-]?\d+)?)"
     r"(?:\s*(?P<unit>" + _UNITS + r")\b|\b)"
 )
 # Further "2m 3s" pieces of a duration written in several units.
@@ -195,7 +195,7 @@ STAMP_TAIL_RE = re.compile(r"(?::\d|/\d|-\d\d-\d\d)")
 VERB_VALUE_RE = re.compile(
     r"(?i)\b(?P<lemma>added|removed|updated|processed|exported|loaded|copied|retired|deleted|inserted|"
     r"appended|downloaded|checked|found|created|committed|reconciled)\b"
-    r"(?:\s+(?P<value>\d[\d,]*(?:\.\d+)?))?"
+    r"(?:\s+(?P<value>\d[\d,]*(?:\.\d+)?(?:[eE][+-]?\d+)?))?"
     r"(?:\s+(?P<object>[A-Za-z][A-Za-z0-9 _/-]{0,60}))?"
 )
 
@@ -210,7 +210,7 @@ VERB_VALUE_RE = re.compile(
 # _hash or Id.
 _SECRET_NAMES = (r"(?:token|password|passwd|passphrase|secret|credentials?|pwd|"
                  r"(?:api|private|access|signing|encryption|ssh|master|account)[_-]?key|"
-                 r"\bpass(?=\s*=)|\b(?:auth|key|sig|signature))")
+                 r"passcode|\b(?:pass|pw)(?=\s*=)|\bpin(?=\s*[=:])|\b(?:auth|key|sig|signature))")
 # A quoted value may hold an escaped quote. A value in braces is the ODBC form
 # PWD={my;pass}. An escaped quote pair is a JSON string held inside a JSON
 # string, as a structured logger writes it. An unquoted value runs to the next
@@ -230,8 +230,11 @@ REDACTIONS = [
      r"\1REDACTED"),
     (re.compile(r"(?i)\b((?:set-)?cookie\\?[\"']?\s*[:=]\s*)(?:" + _QUOTED_VALUE + r"|[^\s;]+(?:;\s*[^\s;]+)*)"),
      r"\1REDACTED"),
-    (re.compile(r"(?i)\b(bearer\s+)[A-Za-z0-9._~+/=-]{8,}"), r"\1REDACTED"),
+    (re.compile(r"(?i)\b(bearer:?\s+)[A-Za-z0-9._~+/=-]{8,}"), r"\1REDACTED"),
     (re.compile(r"\bAKIA[0-9A-Z]{16}\b"), "REDACTED"),
+    (re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})"), "REDACTED"),
+    # sqlcmd takes its password as an upper-case -P. The lower-case -p of psql is a port.
+    (re.compile(r"(?<!\S)(-P\s+)(?:" + _QUOTED_VALUE + r"|(?!--[A-Za-z])\S+)"), r"\1REDACTED"),
     (re.compile(r"(?i)(" + _SECRET_NAMES + _SECRET_SUFFIX + r"\\?[\"']?\s*[=:]\s*)"
                 r"(?:" + _QUOTED_VALUE + r"|" + _BARE_VALUE + r")"),
      r"\1REDACTED"),
@@ -543,7 +546,9 @@ def extract_metrics_from_line(line, refuse_stamps=False):
             continue
         if refuse_stamps and STAMP_TAIL_RE.match(line, match.end("value")):
             continue
-        object_text = normalize_metric_key(match.group("object") or "")
+        # "Processed 500 of 10000 records": the total is not part of the series name.
+        object_text = normalize_metric_key(
+            re.sub(r"(?i)^of\s+\d[\d,]*(?:\.\d+)?\s*", "", match.group("object") or ""))
         label = match.group("lemma").lower()
         if object_text:
             label = label + "_" + object_text
@@ -1954,6 +1959,10 @@ def self_test():
         rc, out, err = capture(lambda: main(["--script", os.path.join(tmp, "nowhere", "x.py"),
                                              "--working-directory", sidecar]))
         check(rc == 0 and "55" in out, "--working-directory mines the sidecar logs")
+        typo = os.path.join(os.path.dirname(script), "nope.py")
+        rc, out, err = capture(lambda: main(["--script", typo]))
+        check(rc == 64 and "is not a file, but its folder exists" in err,
+              "a --script typo beside a real folder is exit 64, not another job's numbers  <-- pinned defect")
         rc, out, err = capture(lambda: main(["--script", script, "--working-directory", tmp]))
         check(rc == 0 and "shared.log" not in out,
               "and an ancestor working directory contributes nothing  <-- pinned defect")
@@ -2180,6 +2189,41 @@ def self_test():
         rc, out, err = capture(lambda: main([dash_log, "--format", "csv"]))
         check(rc == 0 and "abc123" not in out.lower() and "records_updated" in out,
               "a dash-leading password never reaches metric_key or sample_line  <-- pinned defect")
+        # sqlcmd takes the password as -P, and pw= is a common short name.
+        for flag_line, secret in (("sqlcmd -S s -U u -P Xyz987abc Records updated: 5", "Xyz987abc"),
+                                  ("sqlcmd -P 'two words' Records updated: 5", "two words"),
+                                  ("GET https://h/q?pw=Xyz987abc&f=json found 500 features", "Xyz987abc"),
+                                  ("Passcode: 4821 Records updated: 5", "4821"),
+                                  ("PIN=4821 Records updated: 5", "4821"),
+                                  ("token ghp_abcdefghijklmnopqrstuvwxyz0123456789 found 5", "ghp_abc"),
+                                  ("Bearer: abc123def456 found 5 features", "abc123def456")):
+            check(secret not in redact(flag_line) and "REDACTED" in redact(flag_line),
+                  "the secret in %r is blanked  <-- pinned defect" % flag_line[:24])
+        check(redact("psql -p 5432 -P pager=off x").count("REDACTED") == 1
+              and "-p 5432" in redact("psql -p 5432 x"),
+              "a lower-case -p port is left alone")
+        sql_log = write(os.path.join(tmp, "leak", "sql.log"),
+                        "2026-03-04 03:14:07 - INFO - sqlcmd -S s -U u -P Xyz987abc "
+                        "Records updated: 5\n")
+        rc, out, err = capture(lambda: main([sql_log, "--format", "csv"]))
+        check(rc == 0 and "xyz987abc" not in out.lower() and "records_updated" in out,
+              "a sqlcmd password never reaches metric_key or sample_line  <-- pinned defect")
+        # A number in scientific notation is read whole, not by its mantissa.
+        check(mine_line("Feature count: 1.5e+06") == [("feature_count", 1500000.0)]
+              and mine_line("Total records: 1.5E3") == [("total_records", 1500.0)]
+              and mine_line("Feature count: 2e5") == [("feature_count", 200000.0)]
+              and mine_line("Feature count: 1.5e-05") == [("feature_count", 1.5e-05)],
+              "scientific notation is read as the number it is  <-- pinned defect")
+        check(mine_line("Processed 1.5e+06 records") == [("processed_record_count", 1500000.0)],
+              "and so is a sentence count in scientific notation")
+        # A progress phrase with its total keeps one series however the total moves.
+        check(mine_line("Processed 500 of 10000 records") == [("processed_record_count", 500.0)]
+              and mine_line("Processed 600 of 10,001 records") == [("processed_record_count", 600.0)],
+              "'Processed N of TOTAL records' is one series, not one per total  <-- pinned defect")
+        # An HTTP status is a code, not a count, when its reason phrase follows.
+        check(mine_line("Error: 404 Not Found") == [] and mine_line("Warning: 503 Service Unavailable") == []
+              and mine_line("Error: 404") == [("error", 404.0)],
+              "'Error: 404 Not Found' is a status, not an error count  <-- pinned defect")
         # Authorization in a quoted dict or JSON key, a quoted value, or a scheme
         # the first rule did not list.
         for auth_line, secret in (

@@ -36,7 +36,7 @@ and the series stops with no error. `Start-Transcript` writes UTF-8 with a BOM i
 ```
 $ python logsift.py --self-test
 logsift self-test: no network, no database, no arcpy
---------------------------------------------------------------------
+...
 PASS  a thousands separator is read as one number
 ...
 PASS  '2026-03-04 03:14:07 - INFO -' mines exactly one pair, seven seconds  <-- pinned defect
@@ -113,6 +113,7 @@ PASS  a manual run whose first stamp is US dated is left out, not kept  <-- pinn
 PASS  a long run read with --tail is judged by its first line, not its last  <-- pinned defect
 ...
 PASS  and it is not counted as a log file that was read  <-- pinned defect
+...
 PASS  --apply is OFF by default  <-- pinned defect
 ...
 PASS  a unique prefix of --apply is refused, not read as --apply  <-- pinned defect
@@ -123,6 +124,12 @@ PASS  a prefix of --tail is a usage error
 PASS  one bad path among good ones fails the whole run  <-- pinned defect
 ...
 PASS  stdout carries ONLY the data, so a redirect gives a clean csv  <-- pinned defect
+...
+PASS  --max-files keeps the newest only, and exits 3 because an older run was cut  <-- pinned defect
+...
+PASS  a log deleted between the listing and the read exits 3, not 0  <-- pinned defect
+...
+PASS  a --script typo beside a real folder is exit 64, not another job's numbers  <-- pinned defect
 ...
 PASS  --scheduled-at through main leaves manual runs out, counts them, and is exit 3 for a log it could not classify  <-- pinned defect
 ...
@@ -151,25 +158,30 @@ PASS  'DB_PASSWORD' is blanked  <-- pinned defect
 ...
 PASS  the value of the flag in '--password hunter2' is blanked  <-- pinned defect
 ...
+PASS  a flag value that starts with a dash is blanked in 'run.exe --password -Ab'  <-- pinned defect
+...
+PASS  a sqlcmd password never reaches metric_key or sample_line  <-- pinned defect
+PASS  scientific notation is read as the number it is  <-- pinned defect
+...
+PASS  'Processed N of TOTAL records' is one series, not one per total  <-- pinned defect
+PASS  'Error: 404 Not Found' is a status, not an error count  <-- pinned defect
+PASS  the credential in "headers={'Authorization': 'B" is blanked  <-- pinned defect
+...
+PASS  the credential after an unlisted scheme in 'Records checked: 4 Authorization: ' is blanked  <-- pinned defect
+...
+PASS  the password never reaches metric_key  <-- pinned defect
+PASS  'Processed 1432 records in 7 second' charts as one series  <-- pinned defect
+...
 PASS  the tail of 'config pwd=Hun;ter2XYZ R' is blanked too  <-- pinned defect
 ...
 PASS  the tail of 'SDE_PWD=Hunter3Real foun' is blanked too  <-- pinned defect
 ...
-PASS  a flag value that starts with a dash is blanked in 'run.exe --password -Ab'  <-- pinned defect
-PASS  the credential in "headers={'Authorization': 'B" is blanked  <-- pinned defect
-PASS  the credential after an unlisted scheme in 'Records checked: 4 Authorization' is blanked  <-- pinned defect
-...
-PASS  the password never reaches metric_key  <-- pinned defect
-PASS  'Processed 1432 records in 7 seconds' charts as one series  <-- pinned defect
 PASS  a secret with a semicolon in it never reaches metric_key, display_name or sample_line  <-- pinned defect
 PASS  TOKX12 from csv never reaches metric_key or display_name  <-- pinned defect
 ...
 PASS  no mined row carries the token or the password  <-- pinned defect
 ...
 PASS  one unreadable log among good ones is exit 3, and the good rows still print  <-- pinned defect
-...
-PASS  --max-files keeps the newest only, and exits 3 because an older run was cut  <-- pinned defect
-PASS  a log deleted between the listing and the read exits 3, not 0  <-- pinned defect
 ...
 PASS  a folder the account cannot traverse is exit 3, not a PermissionError traceback  <-- pinned defect
 PASS  a secret in a banner never reaches a key under --sections, in csv  <-- pinned defect
@@ -184,7 +196,7 @@ PASS  a failed run's footer names the count and each failure
 PASS  a harness that missed a deliberate failure is named FATAL, not passed over  <-- pinned defect
 PASS  importing the file runs nothing: main() is defined, not called
 --------------------------------------------------------------------
-493 assertions, 0 failed
+507 assertions, 0 failed
 ```
 
 The block above is an excerpt of a real run; the `...` lines stand for omitted lines, and the
@@ -194,12 +206,13 @@ last line is the real footer.
 
 Python 3.9 or newer. Nothing to install, no `arcpy`, no third-party package, no network and no
 database. It runs on ArcGIS Pro's Python and on a plain `python3` equally. The self-test above
-runs 493 assertions on Windows with Python 3.13, 3.12, 3.10 and 3.9, and 479 on Linux with
-Python 3.12. The counts are equal on all five. One label differs by platform:
+runs 507 assertions on Windows with Python 3.13, 3.12, 3.10 and 3.9, and the same 507 on Linux
+with Python 3.9, 3.10, 3.12 and 3.13. One label differs by platform:
 `Logs and LOGS are ONE directory where the filesystem folds case` on Windows reads `... are TWO
-directories where it does not` on Linux, because the test asserts what each filesystem does.
-Branch coverage of `logsift.py` is 100 percent (1270 statements, 300 branches), measured with
-`python -m coverage run --branch logsift.py --self-test`. `pyflakes` is clean, and the file
+directories where it does not` on Linux, because the test asserts what each filesystem does. The
+label differs; the count does not.
+Branch coverage of `logsift.py` is 100 percent (1290 statements, 306 branches), measured with
+`python -m coverage run --branch logsift.py --self-test`, with no line left out. `pyflakes` is clean, and the file
 compiles with `python -W error`.
 
 ```
@@ -272,8 +285,9 @@ Those logs also carry a start time, a batch size and a line reading
 and the third needs a rule, because `verification` is not a word this tool charts on its own.
 
 The data goes to stdout as UTF-8 bytes with LF line ends, and every message goes to stderr, so a
-redirect gives a clean file. The `sample_line` column holds the log line as the log wrote it, with
-any secret that has a name beside it blanked (see below):
+redirect gives a clean file. The `sample_line` column holds the log line with surrounding
+whitespace removed, any secret that has a name beside it blanked (see below), and the text cut to
+240 characters:
 
 ```
 $ python logsift.py parcels/Logs --days 36500 --format csv > metrics.csv
@@ -361,10 +375,12 @@ or bracket is blanked, because the tool cannot tell the credential from the word
 count that follows such a header on the same line is lost. A JSON string held inside a JSON string, which
 writes `\"password\": \"...\"`, is covered. An ODBC value in braces, `PWD={my pass;word}`, is
 blanked whole. An AWS access key id (`AKIA` and 16 capitals or digits) is blanked by its shape
-with no name beside it. The name list is fixed. A `Cookie:` header
-(`sid=...`), `pass=`, `pat=`, `AccountKey=`, a URL-encoded name such as `token%3Dabc`, a short
-flag such as `-p VALUE`, a bare `code=` OAuth value, `bearer=VALUE`, a `Set-Cookie:
-sessionid=...` value and a token with no name beside it are not recognised. A banner under
+with no name beside it. So is a GitHub token (`ghp_`, `gho_`, `ghu_`, `ghs_`, `ghr_` or
+`github_pat_` and 20 or more letters or digits). The sqlcmd flag `-P VALUE`, with an upper-case
+P, is blanked, and so are `pw=`, `pass=`, `Passcode:`, `PIN:`, `Bearer: VALUE`, a `Cookie:` or
+`Set-Cookie:` value and `AccountKey=`. The name list is fixed. `pat=`, a URL-encoded name such
+as `token%3Dabc`, a lower-case flag such as `-p VALUE` (which is a port to psql), a bare `code=`
+OAuth value, `bearer=VALUE` and a token with no name beside it are not recognised. A banner under
 `--sections` is blanked the same way, before it names a section. The text of a key built from
 words that sit before a number is the log's own text, so a secret written as plain words there is
 not covered.
@@ -443,7 +459,8 @@ Lines '2026-03-05' '03:14:00' '1,433' '0:00:08.100000' > nightly_0305.log
 Lines '2026-03-05' '10:42:00' '3' '0:00:02.000000' > manual_1042.log
 ```
 
-The first four bytes of each file were then read back:
+Run the commands above in an empty folder to create the three files; the repository ships no
+fixture files. The first four bytes of each file were then read back:
 
 ```
 $ for f in *.log; do echo $f $(head -c 4 $f | xxd -p); done
@@ -720,18 +737,20 @@ refusing the numbers that are not measurements, and noticing that two spellings 
   spelled differently from the same label in a UTF-8 log (`parcels_chou_s_count`).
 - A decimal comma or a dotted thousands separator is read as an English number: `1.432` is 1.432
   and `1,5` is 15. Logs from a locale with those separators are misread.
-- A duration of a day or more is misread. `Duration: 1 day, 2:03:04` (Python `timedelta`) is 1
-  second, and `Duration: 1.02:03:04` (.NET `TimeSpan`) mines nothing.
+- A duration of a day or more is read in full: `Duration: 1 day, 2:03:04` (Python `timedelta`)
+  and `Duration: 1.02:03:04` (.NET `TimeSpan`) are both 93784 seconds.
 - A number of about 400 digits becomes infinity and prints as `inf` in the table and `Infinity`
   in the json, which is not valid json.
 - `--days` above about 739000 stops with an `OverflowError` traceback. `--days 0` and a negative
   `--days` both end with `no log file in the last N day(s)` and exit 1, and the message does not
   name the flag. `--max-files` below 1 is refused with exit 64. `--max-lines` with a negative
   value such as `-1` is not refused: it reads the whole file, the same as `0`.
-- `--script` with a path that does not exist, run from a folder with no logs, says `no log file
-  in the last 30 day(s) under: .` and exits 1, because the script's parent folder (the current
-  folder) exists. The message `pass a log file or a directory of them, or --script` and exit 64
-  appear only when the parent folder does not exist either.
+- `--script` with a path that does not exist, beside a folder that does, is refused with exit 64
+  and `is not a file, but its folder exists`, because that folder's logs would be charted as
+  this job's. A bare name such as `--script nightly.py` has `.` as its folder, which always
+  exists, so it is refused when the file is absent. Give a path with a folder, or use
+  `--working-directory`. The message `pass a log file or a directory of them, or --script` and
+  exit 64 appear when neither a path nor a script folder exists.
 - A line is read whole. One line of 30 MB with no newline took 78 seconds, because the line limit
   counts lines, not bytes.
 - The data is written to stdout in one call, so a closed pipe such as `| head -1` ends a large
@@ -765,16 +784,17 @@ refusing the numbers that are not measurements, and noticing that two spellings 
 - A closed pipe such as `| head -1` ends a large run with a `BrokenPipeError` traceback and exit
   1, the same code as `nothing to chart`, so exit 1 is ambiguous when the output goes through a
   pipe that can close. A small run (12 rows) exits 0.
-- A line whose only number is an HTTP status in an error line, such as `Error: 404 Not Found`, is
-  charted as the metric `error = 404`. The tool refuses a number that was never a measurement
-  only by label, not by meaning.
+- A three-digit number from 100 to 599 followed by an HTTP reason phrase, such as `Error: 404 Not
+  Found`, is dropped as a status. A bare `Error: 404` is charted as the metric `error = 404`, and
+  so is a status followed by a word that is not on the short reason list. The tool refuses a
+  number that was never a measurement by label and a short phrase list, not by meaning.
 - `Elapsed: 00:01:07` and `Elapsed: 0:07:13` mine nothing, because `elapsed` alone is not in the
   list of duration labels. The labels read as durations are `duration`, `total duration`,
   `elapsed time`, `processing time`, `total execution time`, `total time` and `run time` (also
   `runtime`). This is a missed value, not a wrong one, and a `--rules` file adds a label.
-- A sentence count keeps the words after the number in its key, and a total in those words changes
-  the key: `Processed 500 of 10000 records` is `processed_of_10000_records`, a new series when the
-  total changes.
+- A sentence count keeps the words after the number in its key. A leading `of TOTAL` is cut off,
+  so `Processed 500 of 10000 records` is `processed_record_count`, but another total in the words,
+  such as `Updated 5 records out of 9000`, still changes the key.
 - A log file that is deleted between the folder listing and the modification time check is dropped
   with no warning. Only a failure of the later read, or a deletion during the listing, is named on
   stderr with exit 3.
@@ -827,11 +847,14 @@ refusing the numbers that are not measurements, and noticing that two spellings 
   false positives, not leaks.
 - A secret whose value holds a space, such as `PGPASSWORD=Hunter 2XYZ`, leaves the part after the
   space visible, and the word after it can reach `metric_key`.
+- A secret in a call with no name beside it, such as `GIS(url, user, 'MyP@ssw0rd!')`, in
+  `Using credentials user/pass123`, in `Token expired: VALUE` or in `password is VALUE`, stays
+  visible in `sample_line` and can reach `metric_key`.
 - A secret written as plain words with no `=` or `:` after its name, such as `Using token VALUE`,
   `Token acquired: VALUE`, `with password VALUE` or `Got token VALUE expires in 60 seconds`, stays
   visible in `sample_line`.
-- A short or plural secret name is not on the fixed list: `pw=`, `cred=`, `tok=`,
-  `subscription_key=`, `tokens:`, `Passwords:`, the SQL tool flag `-P VALUE` and the attached form
+- A short or plural secret name is not on the fixed list: `cred=`, `tok=`, `pat=`,
+  `subscription_key=`, `tokens:`, `Passwords:` and the attached form
   `-pVALUE` are not blanked. A camelCase name that ends in `Key`, such as `licenseKey=`,
   `appKey=` or `subscriptionKey=`, is the same class. The flag forms `--pass VALUE` and
   `--db-pass VALUE` are covered, but the plain words `Pass: VALUE` are not, and the value can
@@ -862,9 +885,20 @@ refusing the numbers that are not measurements, and noticing that two spellings 
   that starts with a line feed, spaces before an `=`, or a full-width sign is written unguarded.
 - A sentence prefixed label splits a series: `Step 2 records updated: 5` is keyed
   `step_2_records_updated`, not `updated_record_count`. A progress line such as `Checked 5 of 10
-  records` mines the stray key `checked_of_10_records`, a bare `Elapsed: 1.5 min` is converted and
+  records` is `checked_record_count`, the total is cut off, a bare `Elapsed: 1.5 min` is converted and
   then dropped by the vocabulary filter (`Elapsed time: 1.5 min` works), and a count written after
   the verb (`250 features added`) is not mined.
+- Only files that end in `.log` or `.txt` are read. A rotated name such as `job.log.1` or
+  `job.log.2026-03-03` is skipped with no warning, so a run can exit 0 with older runs missing.
+- A log with no lines, only a BOM, or no number that survives the filters exits 1, the same code
+  as `nothing to chart` and as a crash. A wrapper cannot tell a job that wrote an empty log from a
+  tool crash.
+- `--apply` without `--out` writes nothing, prints the table and the summary line, and exits 0, so a scheduled
+  task with that mistake looks successful.
+- A number with 23 digits such as `Duration: 99999999999999999999999 s` is charted as `1e+23`, and
+  `Rows: 1,2,3` is charted as 123. The tool does not question a value that parses.
+- A decimal comma, a dotted thousands separator and a space grouped thousands are misread:
+  `Records: 1.234.567` is 1.234 and `Records updated: 12 345` is 12.
 - `--days` with a very large number (1000000 or more) ends in an `OverflowError` traceback and
   exit 1, the same code as nothing to chart.
 - A folder that can be read but not searched (Linux mode 444) lists its files and then ends in a
@@ -906,8 +940,11 @@ Behaviour this tool relies on, and where it was checked:
   [OWASP, CSV Injection](https://owasp.org/www-community/attacks/CSV_Injection).
   Read on 2026-11-11. The page lists a line feed and full-width signs as well, which this tool
   does not guard.
+- `sqlcmd` takes its password as `-P password` and prints statistics for `-p[1]`, so only the
+  upper-case flag is blanked: [sqlcmd utility](https://learn.microsoft.com/en-us/sql/tools/sqlcmd/sqlcmd-utility).
+  Read on 2026-11-12.
 - Python 3.9.25 and 3.10.20 leave a lone carriage return unquoted under an LF line terminator,
-  and 3.12 and 3.13 quote it. This was measured, not read: with the whole-row quoting removed,
+  and 3.12 and 3.13 quote it. This was measured on all four with the csv module, not read: with the whole-row quoting removed,
   the self-test fails on 3.9.25 and 3.10.20 and passes on 3.12 and 3.13.
 
 No Esri, SQL Server or Census behaviour is used.
