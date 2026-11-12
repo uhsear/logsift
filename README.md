@@ -157,7 +157,10 @@ PASS  the tail of 'SDE_PWD=Hunter3Real foun' is blanked too  <-- pinned defect
 ...
 PASS  a flag value that starts with a dash is blanked in 'run.exe --password -Ab'  <-- pinned defect
 PASS  the credential in "headers={'Authorization': 'B" is blanked  <-- pinned defect
+PASS  the credential after an unlisted scheme in 'Records checked: 4 Authorization' is blanked  <-- pinned defect
 ...
+PASS  the password never reaches metric_key  <-- pinned defect
+PASS  'Processed 1432 records in 7 seconds' charts as one series  <-- pinned defect
 PASS  a secret with a semicolon in it never reaches metric_key, display_name or sample_line  <-- pinned defect
 PASS  TOKX12 from csv never reaches metric_key or display_name  <-- pinned defect
 ...
@@ -181,7 +184,7 @@ PASS  a failed run's footer names the count and each failure
 PASS  a harness that missed a deliberate failure is named FATAL, not passed over  <-- pinned defect
 PASS  importing the file runs nothing: main() is defined, not called
 --------------------------------------------------------------------
-479 assertions, 0 failed
+493 assertions, 0 failed
 ```
 
 The block above is an excerpt of a real run; the `...` lines stand for omitted lines, and the
@@ -191,11 +194,11 @@ last line is the real footer.
 
 Python 3.9 or newer. Nothing to install, no `arcpy`, no third-party package, no network and no
 database. It runs on ArcGIS Pro's Python and on a plain `python3` equally. The self-test above
-runs 479 assertions on Windows with Python 3.13, 3.12, 3.10 and 3.9, and 479 on Linux with
+runs 493 assertions on Windows with Python 3.13, 3.12, 3.10 and 3.9, and 479 on Linux with
 Python 3.12. The counts are equal on all five. One label differs by platform:
 `Logs and LOGS are ONE directory where the filesystem folds case` on Windows reads `... are TWO
 directories where it does not` on Linux, because the test asserts what each filesystem does.
-Branch coverage of `logsift.py` is 100 percent (1261 statements, 296 branches), measured with
+Branch coverage of `logsift.py` is 100 percent (1270 statements, 300 branches), measured with
 `python -m coverage run --branch logsift.py --self-test`. `pyflakes` is clean, and the file
 compiles with `python -W error`.
 
@@ -347,13 +350,15 @@ cannot reach `metric_key` or `display_name` in those forms either. This is best 
 with no name beside it cannot be found, and neither can one with a space and no `=` or `:` after
 its name (`password hunter2`). A value with a space in it that is not quoted ends at the space,
 and the rest of it stays visible. A command line flag with a space before its value, such as
-`--password hunter2`, `--client-secret hunter2` or the PowerShell form `-Password hunter2`, is
-covered, and so is the same flag with a quoted value. A value that starts with a single dash,
+`--password hunter2`, `--pass hunter2`, `--client-secret hunter2` or the PowerShell form
+`-Password hunter2`, is covered, and so is the same flag with a quoted value. A value that starts with a single dash,
 such as `--password -Abc123`, is blanked as a value; only a word that starts with two dashes and a
 letter is read as the next flag and kept. The credential after `Authorization` is blanked in a
 quoted dict or JSON key, in a quoted value, and after `Bearer`, `Basic`, `Negotiate`, `Token`,
-`NTLM`, `HOBA`, `Mutual`, `ApiKey` or `AWS4-HMAC-SHA256`; after `Digest` the rest of the line is
-blanked, because its fields are comma separated. A JSON string held inside a JSON string, which
+`NTLM`, `HOBA`, `Mutual`, `ApiKey` or `AWS4-HMAC-SHA256`; after `Digest`, or after any other scheme
+word (`SSWS`, `Splunk`, `SharedKey`, `OAuth`), the rest of the line up to a closing quote, brace
+or bracket is blanked, because the tool cannot tell the credential from the words after it, so a
+count that follows such a header on the same line is lost. A JSON string held inside a JSON string, which
 writes `\"password\": \"...\"`, is covered. An ODBC value in braces, `PWD={my pass;word}`, is
 blanked whole. An AWS access key id (`AKIA` and 16 capitals or digits) is blanked by its shape
 with no name beside it. The name list is fixed. A `Cookie:` header
@@ -600,7 +605,7 @@ because you named the key yourself. That is how `verification` above gets mined 
 ## Exit codes
 
 0 metrics mined, 1 nothing to chart, 2 the write step failed, 3 the series is known to be
-incomplete or unclassified (a log file could not be read, a folder could not be listed,
+incomplete or unclassified (a log file could not be opened, a folder could not be listed,
 `--max-lines` cut a log short, or `--scheduled-at` could not classify a log), 64 usage error. Every usage error exits 64, including one that
 the argument parser raises, such as an unknown flag or `--days x`.
 
@@ -719,11 +724,14 @@ refusing the numbers that are not measurements, and noticing that two spellings 
   second, and `Duration: 1.02:03:04` (.NET `TimeSpan`) mines nothing.
 - A number of about 400 digits becomes infinity and prints as `inf` in the table and `Infinity`
   in the json, which is not valid json.
-- `--days` above about 739000 stops with an `OverflowError` traceback. A negative `--max-files`
-  such as `-1` silently drops the oldest file. `--max-files 0` and a negative `--days` both end
-  with `no log file in the last N day(s)` and exit 1, and the message does not name the flag.
-  `--script` with a path that does not exist and no logs elsewhere says `pass a log file or a
-  directory of them, or --script`, although `--script` was given.
+- `--days` above about 739000 stops with an `OverflowError` traceback. `--days 0` and a negative
+  `--days` both end with `no log file in the last N day(s)` and exit 1, and the message does not
+  name the flag. `--max-files` below 1 is refused with exit 64. `--max-lines` with a negative
+  value such as `-1` is not refused: it reads the whole file, the same as `0`.
+- `--script` with a path that does not exist, run from a folder with no logs, says `no log file
+  in the last 30 day(s) under: .` and exits 1, because the script's parent folder (the current
+  folder) exists. The message `pass a log file or a directory of them, or --script` and exit 64
+  appear only when the parent folder does not exist either.
 - A line is read whole. One line of 30 MB with no newline took 78 seconds, because the line limit
   counts lines, not bytes.
 - The data is written to stdout in one call, so a closed pipe such as `| head -1` ends a large
@@ -754,8 +762,9 @@ refusing the numbers that are not measurements, and noticing that two spellings 
 - A log file name is never redacted. It goes to stdout, to the csv and json, and to stderr as it
   is, so a secret placed in a file name is printed. A control character or an ANSI escape in a
   file name is printed raw in the table and on stderr, and only the csv guards the first character.
-- `| head -1` ends the run with a `BrokenPipeError` traceback and exit 1, the same code as
-  `nothing to chart`, so exit 1 is ambiguous when the output goes through a pipe that can close.
+- A closed pipe such as `| head -1` ends a large run with a `BrokenPipeError` traceback and exit
+  1, the same code as `nothing to chart`, so exit 1 is ambiguous when the output goes through a
+  pipe that can close. A small run (12 rows) exits 0.
 - A line whose only number is an HTTP status in an error line, such as `Error: 404 Not Found`, is
   charted as the metric `error = 404`. The tool refuses a number that was never a measurement
   only by label, not by meaning.
@@ -766,8 +775,9 @@ refusing the numbers that are not measurements, and noticing that two spellings 
 - A sentence count keeps the words after the number in its key, and a total in those words changes
   the key: `Processed 500 of 10000 records` is `processed_of_10000_records`, a new series when the
   total changes.
-- A log file that is deleted between the folder listing and the modification time check is dropped with no
-  warning. Only a failure of the later read is warned about.
+- A log file that is deleted between the folder listing and the modification time check is dropped
+  with no warning. Only a failure of the later read, or a deletion during the listing, is named on
+  stderr with exit 3.
 - When `--scheduled-at` removes every row as a manual run, the message `no number in those logs
   survived the rules` names the wrong cause. Exit 1 is still right. Read the line `manual run(s)
   left out of the series` above it.
@@ -821,7 +831,29 @@ refusing the numbers that are not measurements, and noticing that two spellings 
   `Token acquired: VALUE`, `with password VALUE` or `Got token VALUE expires in 60 seconds`, stays
   visible in `sample_line`.
 - A short or plural secret name is not on the fixed list: `pw=`, `cred=`, `tok=`,
-  `subscription_key=`, `tokens:`, `Passwords:` and the SQL tool flag `-P VALUE` are not blanked.
+  `subscription_key=`, `tokens:`, `Passwords:`, the SQL tool flag `-P VALUE` and the attached form
+  `-pVALUE` are not blanked. A camelCase name that ends in `Key`, such as `licenseKey=`,
+  `appKey=` or `subscriptionKey=`, is the same class. The flag forms `--pass VALUE` and
+  `--db-pass VALUE` are covered, but the plain words `Pass: VALUE` are not, and the value can
+  reach `metric_key`, which the csv writes.
+- A URL whose user name holds an unencoded `@`, such as `smtp://john@corp.example:pw@mail.example`,
+  leaves the password visible. The percent-encoded `john%40corp.example` is blanked.
+- A single token of 100 KB or more that starts with a dash stalls the run for many seconds
+  (36 seconds for 100 KB, about 0.4 seconds for 10 KB), because the flag redaction pattern
+  backtracks on it.
+- On Linux, a log file name that is not valid UTF-8 ends the table and csv output with a
+  `UnicodeEncodeError` traceback and exit 1. The json format works.
+- A crash of any kind exits 1, the same code as nothing to chart. No run that crashes reports
+  clean, but a wrapper cannot tell the two apart.
+- `--out FILE --apply` can name a log being mined, for example `logsift victim.log --out
+  victim.log --apply`, and replaces it with the csv. A `.log` or `.txt` csv written into a mined
+  folder is mined on the next run.
+- A rules file saved with a UTF-8 BOM is refused with exit 64 and the Python message `Unexpected
+  UTF-8 BOM (decode using utf-8-sig)`. Save the file as UTF-8 without a BOM.
+- The vocabulary and noise filters drop real values without a warning: `Loaded: 0 records` mines
+  nothing, and `Duration 0:00:07` with no colon after the label is refused with no message.
+- A row with a line break in any text cell has every field quoted, including `metric_value`
+  (`"7.133764"`). A spreadsheet still reads it as a number.
 - A password that holds an `@` in `scheme://user:pa@ss@host` leaves the part after the first `@`
   visible, and `--password --Abc` is read as a flag followed by a flag, so `--Abc` is kept.
 - `AWS Access Key ID: AKIA...` is blanked by the shape of the id only. A secret key written beside
@@ -842,7 +874,8 @@ refusing the numbers that are not measurements, and noticing that two spellings 
 - `--out FILE --apply` opens the file for writing directly, so a write that fails part way, such as
   a full disk, truncates the previous good csv. The write is not atomic.
 - The claim that logsift runs on ArcGIS Pro's Python was exercised under the conda environment
-  `asirpro` (Python 3.11.8), not under a Pro installation's own interpreter.
+  `asirpro` (Python 3.11.8) and under a Pro installation's own `arcgispro-py3` (Python 3.13.7),
+  where the self-test passes with the same count.
 
 ## Name
 

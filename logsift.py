@@ -218,14 +218,14 @@ _SECRET_SUFFIX = r"(?:[_-]?(?:hash|value|string|id|access[_-]?key|key|token|secr
 _AUTH_SCHEMES = r"bearer|basic|negotiate|token|ntlm|hoba|mutual|apikey|aws4-hmac-sha256"
 REDACTIONS = [
     (re.compile(r"(?i)\b(authorization\\?[\"']?\s*[:=]\s*)(?:" + _QUOTED_VALUE + r"|digest\s+.*|"
-                r"(?:" + _AUTH_SCHEMES + r")\s+[^\s,;\"']+|[^\s,;\"']+)"),
+                r"(?:" + _AUTH_SCHEMES + r")\s+[^\s,;\"']+|[^\s,;\"']+(?:\s+[^\"'}\]]*)?)"),
      r"\1REDACTED"),
     (re.compile(r"(?i)\b(bearer\s+)[A-Za-z0-9._~+/=-]{8,}"), r"\1REDACTED"),
     (re.compile(r"\bAKIA[0-9A-Z]{16}\b"), "REDACTED"),
     (re.compile(r"(?i)(" + _SECRET_NAMES + _SECRET_SUFFIX + r"\\?[\"']?\s*[=:]\s*)"
                 r"(?:" + _QUOTED_VALUE + r"|" + _BARE_VALUE + r")"),
      r"\1REDACTED"),
-    (re.compile(r"(?i)(?<!\S)(--?[a-z0-9_-]*?" + _SECRET_NAMES + _SECRET_SUFFIX + r"\s+)"
+    (re.compile(r"(?i)(?<!\S)(--?[a-z0-9_-]*?(?:" + _SECRET_NAMES + r"|(?<=[-_])(?:pass|pw))" + _SECRET_SUFFIX + r"\s+)"
                 r"(?:" + _QUOTED_VALUE + r"|(?!--[A-Za-z])\S+)"), r"\1REDACTED"),
     (re.compile(r"(?i)\b([a-z][a-z0-9+.-]*://)[^/\s:@]*:[^/\s@]+@"), r"\1REDACTED@"),
 ]
@@ -421,6 +421,12 @@ def normalize_metric_key(label):
     return clean[:80] if clean else ""
 
 
+# "Processed 1432 records in 7 seconds" captures the timing as part of the label.
+# The timing differs every run, so the key would mint a new series every run.
+_TRAILING_TIMING_RE = re.compile(
+    r"_in_\d+_(?:ms|milliseconds?|s|secs?|seconds?|mins?|minutes?|h|hours?)$")
+
+
 def canonicalize_metric_key(metric_key, rules=()):
     """Map a raw label to a canonical metric key, or None if it is not a metric.
 
@@ -434,7 +440,7 @@ def canonicalize_metric_key(metric_key, rules=()):
     try, a rule written against the name you can see in the output would look
     correct and quietly do nothing.
     """
-    key = normalize_metric_key(metric_key)
+    key = _TRAILING_TIMING_RE.sub("", normalize_metric_key(metric_key))
     if not key:
         return None
 
@@ -2178,6 +2184,36 @@ def self_test():
         check(redact("Authorization: NTLM TlRMTVNTUAAB found 5 features")
               == "Authorization: REDACTED found 5 features",
               "a scheme word and its blob go together, and the count after them stays  <-- pinned defect")
+        # A scheme the list does not name still hides its credential.
+        for auth_line, secret in (
+                ("Records checked: 4 Authorization: SSWS 00abcSECRET", "00abcSECRET"),
+                ("Records loaded: 7 Authorization: Foo bar111SECRETq", "bar111SECRETq"),
+                ("Authorization: Splunk SECRETVAL12", "SECRETVAL12"),
+                ("Authorization: SharedKey acct:SECRETVAL12", "SECRETVAL12"),
+                ("Authorization: Custom s3cr3t", "s3cr3t"),
+                ("Authorization: OAuth oauth_token=SECRETVAL12 found 5 rows", "SECRETVAL12")):
+            check(secret not in redact(auth_line) and "REDACTED" in redact(auth_line),
+                  "the credential after an unlisted scheme in %r is blanked  <-- pinned defect"
+                  % auth_line[:34])
+        check(redact("headers={Authorization: Foo bar111, Accept: json} found 5")
+              == "headers={Authorization: REDACTED} found 5",
+              "an unlisted scheme is blanked to the closing brace, not past it  <-- pinned defect")
+        # --pass is a password flag. --bypass and --compass are not.
+        check("hunter2" not in redact("connect with --pass hunter2 then Records updated: 5")
+              and "hunter2" not in redact("run.exe -db-pass hunter2 x")
+              and "hunter2" not in redact("run.exe --db_pw hunter2 x"),
+              "the value after --pass, -db-pass and --db_pw is blanked  <-- pinned defect")
+        check(redact("run --bypass cache x") == "run --bypass cache x"
+              and redact("run --compass north x") == "run --compass north x",
+              "a flag that merely ends in pass is left alone")
+        check(mine_line(redact("connect with --pass hunter2 then Records updated: 5"))
+              == [("connect_with_pass_redacted_then_records_updated", 5.0)],
+              "the password never reaches metric_key  <-- pinned defect")
+        # A timing at the end of the label is not part of the series name.
+        for timing_line in ("Processed 1432 records in 7 seconds", "Processed 1433 records in 8 seconds",
+                            "Processed 1434 records in 3 minutes", "Processed 1435 records in 12 s"):
+            check([key for key, _ in mine_line(timing_line)] == ["processed_record_count"],
+                  "%r charts as one series  <-- pinned defect" % timing_line[:34])
         # A JSON string inside a JSON string escapes its quotes.
         check("S3cr3tVALUE9z" not in redact(r'{"msg": "{\"password\": \"S3cr3tVALUE9z\"}", "n": 5}')
               and "S3cr3tVALUE9z" not in redact(r'{"msg": "{\"token\": \"two S3cr3tVALUE9z\"}"}'),
