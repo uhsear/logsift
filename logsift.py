@@ -150,6 +150,7 @@ LOG_PREAMBLE_RE = re.compile(
 HMS_DURATION_RE = re.compile(
     r"(?i)\b(?P<label>duration|total duration|elapsed time|processing time|total execution time|"
     r"total time|run[ _]?time)\s*:\s*"
+    r"(?:(?P<days>\d+)(?:\s+days?,\s*|\.(?=\d+:\d+:\d)))?"
     r"(?:(?P<hours>\d+):)?(?P<minutes>\d{1,2}):(?P<seconds>\d{1,2}(?:\.\d+)?)"
 )
 # The seconds field takes one digit or two, like the minutes field. A logger
@@ -177,6 +178,13 @@ DURATION_TAIL_RE = re.compile(
 _DURATION_KEYS = (r"(?:duration|total_duration|elapsed_time|processing_time|total_time|"
                   r"total_execution_time|run_time|runtime)")
 
+# "Error: 404 Not Found": the number is an HTTP status the server sent back, and
+# the reason phrase after it says so. It is a code, never a count.
+HTTP_REASON_RE = re.compile(
+    r"(?i)\s+(?:Bad Request|Unauthorized|Forbidden|Not Found|Method Not Allowed|"
+    r"Request Timeout|Conflict|Gone|Too Many Requests|Internal Server Error|Bad Gateway|"
+    r"Service Unavailable|Gateway Time-?out)\b")
+
 # What follows the number when the number is really a date or a clock: the "03"
 # of "03:14:07", the "12" of "12/31/2025", the year of "2026-03-04". A label
 # that holds a timestamp ("Updated: 2026-03-04 03:14:07") must not chart the
@@ -201,8 +209,8 @@ VERB_VALUE_RE = re.compile(
 # name may be quoted, as in JSON and a Python dict, and may end in a word such as
 # _hash or Id.
 _SECRET_NAMES = (r"(?:token|password|passwd|passphrase|secret|credentials?|pwd|"
-                 r"(?:api|private|access|signing|encryption|ssh|master)[_-]?key|"
-                 r"\b(?:auth|key|sig|signature))")
+                 r"(?:api|private|access|signing|encryption|ssh|master|account)[_-]?key|"
+                 r"\bpass(?=\s*=)|\b(?:auth|key|sig|signature))")
 # A quoted value may hold an escaped quote. A value in braces is the ODBC form
 # PWD={my;pass}. An escaped quote pair is a JSON string held inside a JSON
 # string, as a structured logger writes it. An unquoted value runs to the next
@@ -219,6 +227,8 @@ _AUTH_SCHEMES = r"bearer|basic|negotiate|token|ntlm|hoba|mutual|apikey|aws4-hmac
 REDACTIONS = [
     (re.compile(r"(?i)\b(authorization\\?[\"']?\s*[:=]\s*)(?:" + _QUOTED_VALUE + r"|digest\s+.*|"
                 r"(?:" + _AUTH_SCHEMES + r")\s+[^\s,;\"']+|[^\s,;\"']+(?:\s+[^\"'}\]]*)?)"),
+     r"\1REDACTED"),
+    (re.compile(r"(?i)\b((?:set-)?cookie\\?[\"']?\s*[:=]\s*)(?:" + _QUOTED_VALUE + r"|[^\s;]+(?:;\s*[^\s;]+)*)"),
      r"\1REDACTED"),
     (re.compile(r"(?i)\b(bearer\s+)[A-Za-z0-9._~+/=-]{8,}"), r"\1REDACTED"),
     (re.compile(r"\bAKIA[0-9A-Z]{16}\b"), "REDACTED"),
@@ -504,7 +514,8 @@ def extract_metrics_from_line(line, refuse_stamps=False):
     seen = set()
 
     for match in HMS_DURATION_RE.finditer(line):
-        total = (float(match.group("hours") or 0) * 3600.0
+        total = (float(match.group("days") or 0) * 86400.0
+                 + float(match.group("hours") or 0) * 3600.0
                  + float(match.group("minutes") or 0) * 60.0
                  + float(match.group("seconds") or 0))
         if "duration_seconds" not in seen:
@@ -516,6 +527,9 @@ def extract_metrics_from_line(line, refuse_stamps=False):
         label = normalize_metric_key(match.group("label"))
         value = parse_number(match.group("value"))
         if refuse_stamps and STAMP_TAIL_RE.match(line, match.end("value")):
+            continue
+        if (not match.group("unit") and re.fullmatch(r"[1-5]\d\d", match.group("value"))
+                and HTTP_REASON_RE.match(line, match.end("value"))):
             continue
         if match.group("unit") and re.search(r"duration|elapsed|(?:^|_)time$|runtime", label):
             value = value * unit_seconds(match.group("unit")) + _tail_seconds(line, match.end())
@@ -2571,6 +2585,17 @@ def main(argv=None):
     missing = [path for path in args.paths if not os.path.exists(path)]
     if missing:
         _emit("error: no such file or directory: %s" % ", ".join(missing))
+        return 64
+
+    # A script that is not there, beside a folder that is, is a typo or a
+    # renamed script. Its folder would be mined as this job's logs, another
+    # job's numbers charted as this one. A script whose folder is absent too is
+    # an off-host path, and --working-directory or the named paths can carry it.
+    script_text = _clean_text(args.script)
+    if (script_text and not os.path.isfile(script_text)
+            and os.path.isdir(str(Path(script_text).parent))):
+        _emit("error: --script %s is not a file, but its folder exists. Check the "
+              "spelling: that folder's logs would be charted as this job's." % script_text)
         return 64
 
     named_files = [Path(path) for path in args.paths if os.path.isfile(path)]
