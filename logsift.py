@@ -209,8 +209,8 @@ VERB_VALUE_RE = re.compile(
 # name may be quoted, as in JSON and a Python dict, and may end in a word such as
 # _hash or Id.
 _SECRET_NAMES = (r"(?:token|password|passwd|passphrase|secret|credentials?|pwd|"
-                 r"(?:api|private|access|signing|encryption|ssh|master|account)[_-]?key|"
-                 r"passcode|\b(?:pass|pw)(?=\s*=)|\bpin(?=\s*[=:])|\b(?:auth|key|sig|signature))")
+                 r"(?:api|private|access|signing|encryption|ssh|master|account|subscription)[_-]?key|"
+                 r"session[_-]?id|passcode|\bcred(?=\s*[=:])|\b(?:pass|pw)(?=\s*=)|\bpin(?=\s*[=:])|\b(?:auth|key|sig|signature))")
 # A quoted value may hold an escaped quote. A value in braces is the ODBC form
 # PWD={my;pass}. An escaped quote pair is a JSON string held inside a JSON
 # string, as a structured logger writes it. An unquoted value runs to the next
@@ -230,8 +230,21 @@ REDACTIONS = [
      r"\1REDACTED"),
     (re.compile(r"(?i)\b((?:set-)?cookie\\?[\"']?\s*[:=]\s*)(?:" + _QUOTED_VALUE + r"|[^\s;]+(?:;\s*[^\s;]+)*)"),
      r"\1REDACTED"),
-    (re.compile(r"(?i)\b(bearer:?\s+)[A-Za-z0-9._~+/=-]{8,}"), r"\1REDACTED"),
+    # A bare "Bearer VALUE": 8 characters or more, or 4 or more that hold a digit. A plain
+    # word such as "Bearer tokens" is left alone.
+    (re.compile(r"(?i)\b(bearer:?\s+)(?:(?=[A-Za-z0-9._~+/=-]*\d)[A-Za-z0-9._~+/=-]{4,}|[A-Za-z0-9._~+/=-]{8,})"),
+     r"\1REDACTED"),
     (re.compile(r"\bAKIA[0-9A-Z]{16}\b"), "REDACTED"),
+    (re.compile(r"\bnpm_[A-Za-z0-9]{30,}"), "REDACTED"),
+    (re.compile(r"\bxox[abprs]-[A-Za-z0-9-]{10,}"), "REDACTED"),
+    (re.compile(r"(?i)(hooks\.slack\.com/services/)[A-Za-z0-9/_-]+"), r"\1REDACTED"),
+    (re.compile(r"(?i)(ConvertTo-SecureString\s+(?:-String\s+)?)(?:" + _QUOTED_VALUE + r"|(?!-)[^\s)]+)"),
+     r"\1REDACTED"),
+    # A secret name and its value with only a space between, as "password hunter2". Prose such
+    # as "password expired" is left alone: the value must hold a letter and a digit, or be quoted.
+    (re.compile(r"(?i)(?<!-)\b((?:token|password|passwd|passphrase|secret|credentials?|pwd|passcode)s?"
+                r"(?:\s*[=:]\s*|\s+))(?:(?=\S*[A-Za-z])(?=\S*\d)[^\s&;,)\]]{4,}|(?<=\s)" + _QUOTED_VALUE + r")"),
+     r"\1REDACTED"),
     (re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})"), "REDACTED"),
     # sqlcmd takes its password as an upper-case -P. The lower-case -p of psql is a port.
     (re.compile(r"(?<!\S)(-P\s+)(?:" + _QUOTED_VALUE + r"|(?!--[A-Za-z])\S+)"), r"\1REDACTED"),
@@ -351,9 +364,11 @@ def sniff_encoding(sample):
         even = sample[0:pairs * 2:2].count(0)
         odd = sample[1:pairs * 2:2].count(0)
         # Zeros in both halves is a NUL padded file, not UTF-16.
-        if odd * 2 > pairs and even * 10 < pairs:
+        # A real UTF-16 file starts in UTF-16: its first unit holds the zero. A UTF-8 log
+        # that a later ">>" extended in UTF-16 has no zero there, so it stays UTF-8.
+        if odd * 2 > pairs and even * 10 < pairs and sample[1] == 0:
             return "utf-16-le", 0, 2
-        if even * 2 > pairs and odd * 10 < pairs:
+        if even * 2 > pairs and odd * 10 < pairs and sample[0] == 0:
             return "utf-16-be", 0, 2
     return "utf-8", 0, 1
 
@@ -1377,6 +1392,10 @@ def self_test():
           "utf-16le with no bom is told by its zero bytes")
     check(sniff_encoding(text.encode("utf-16-be")) == ("utf-16-be", 0, 2),
           "and utf-16be by which half of each pair holds them")
+    mixed_head = "Records updated: 5\r\n".encode("utf-8")
+    check(sniff_encoding(mixed_head + text.encode("utf-16-le") * 3)[0] == "utf-8"
+          and sniff_encoding(mixed_head + text.encode("utf-16-be") * 3)[0] == "utf-8",
+          "a short utf-8 head before appended utf-16 text keeps the file utf-8  <-- pinned defect")
     check(sniff_encoding(b"") == ("utf-8", 0, 1), "an empty file is utf-8")
     check(sniff_encoding(b"\x00" * 64) == ("utf-8", 0, 1),
           "a file padded with nuls is not utf-16: zeros in both halves")
@@ -1648,6 +1667,11 @@ def self_test():
                                      + codecs.BOM_UTF16_LE + "Records checked: 9\r\n".encode("utf-16-le")))
         check(list(mixed["metrics"]) == ["updated_record_count"],
               "a utf-16 tail appended to a utf-8 log is not mined: a named limit")
+        short = scan_log_file(wbytes("mixed_short.log", b"Records updated: 3\r\n"
+                                     + "Records checked: 9\r\n".encode("utf-16-le") * 3))
+        check(short["encoding"] == "utf-8" and short["metrics"]["updated_record_count"][0] == 3.0
+              and "checked_record_count" not in short["metrics"],
+              "a short utf-8 head keeps its metric when utf-16 text is appended  <-- pinned defect")
 
         # ---- tail read
         check(scan_log_file(Path(running), max_lines=2, tail=True)["metrics"]["updated_record_count"][0]
@@ -2212,6 +2236,30 @@ def self_test():
                                   ("Bearer: abc123def456 found 5 features", "abc123def456")):
             check(secret not in redact(flag_line) and "REDACTED" in redact(flag_line),
                   "the secret in %r is blanked  <-- pinned defect" % flag_line[:24])
+        # A secret name with only a space or a plural s before its value, a few more
+        # names, and a bare token of a known shape.
+        for flag_line, secret in (("Using token abcdef123 and found 5 records", "abcdef123"),
+                                  ("found 5 records with password hunter2", "hunter2"),
+                                  ("Passwords: abc123 5 records", "abc123"),
+                                  ("login failed for user 'x' password 'Sw0rdfish' 5 records", "Sw0rdfish"),
+                                  ("subscriptionKey=abc123 5 records", "abc123"),
+                                  ("cred=abc123 5 records", "abc123"),
+                                  ("sessionid=abc123 found 5 records", "abc123"),
+                                  ("npm_" + "a1" * 18 + " found 5", "npm_a1"),
+                                  ("xoxb-12345678901-abcdefghij found 5", "xoxb-1234"),
+                                  ("post https://hooks.slack.com/services/T01/B02/abcDEF found 5", "abcDEF"),
+                                  ('run -Password (ConvertTo-SecureString "Secr3t" -AsPlainText) 5 rows', "Secr3t"),
+                                  ("Bearer abc123 5 records", "abc123")):
+            check(secret not in redact(flag_line) and "REDACTED" in redact(flag_line),
+                  "the secret in %r is blanked  <-- pinned defect" % flag_line[:24])
+        for prose in ("password expired for 5 records", "Bearer tokens found 5",
+                      "token 2026-03-04 5 records", "Tokens: 1200 issued", "Secret 12 of 40"):
+            check(redact(prose) == prose, "prose and counts in %r are left alone" % prose[:24])
+        spaced_log = write(os.path.join(tmp, "leak", "spaced.log"),
+                           "2026-03-04 03:14:07 - INFO - Using token abcdef123 found 5 records\n")
+        rc, out, err = capture(lambda: main([spaced_log, "--format", "csv"]))
+        check(rc == 0 and "abcdef123" not in out and "records" in out,
+              "a spaced secret never reaches metric_key or sample_line  <-- pinned defect")
         check(redact("psql -p 5432 -P pager=off x").count("REDACTED") == 1
               and "-p 5432" in redact("psql -p 5432 x"),
               "a lower-case -p port is left alone")

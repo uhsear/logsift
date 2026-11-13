@@ -196,7 +196,7 @@ PASS  a failed run's footer names the count and each failure
 PASS  a harness that missed a deliberate failure is named FATAL, not passed over  <-- pinned defect
 PASS  importing the file runs nothing: main() is defined, not called
 --------------------------------------------------------------------
-517 assertions, 0 failed
+537 assertions, 0 failed
 ```
 
 The block above is an excerpt of a real run; the `...` lines stand for omitted lines, and the
@@ -206,12 +206,12 @@ last line is the real footer.
 
 Python 3.9 or newer. Nothing to install, no `arcpy`, no third-party package, no network and no
 database. It runs on ArcGIS Pro's Python and on a plain `python3` equally. The self-test above
-runs 517 assertions on Windows with Python 3.13, 3.12, 3.10 and 3.9, and the same 517 on Linux
+runs 537 assertions on Windows with Python 3.13, 3.12, 3.10 and 3.9, and the same 537 on Linux
 with Python 3.9, 3.10, 3.12 and 3.13. One label differs by platform:
 `the Logs and LOGS are ONE directory where the filesystem folds case` on Windows reads `... are TWO
 directories where it does not` on Linux, because the test asserts what each filesystem does. The
 label differs; the count does not.
-Branch coverage of `logsift.py` is 100 percent (1307 statements, 312 branches), measured with
+Branch coverage of `logsift.py` is 100 percent (1318 statements, 316 branches), measured with
 `python -m coverage run --branch logsift.py --self-test`, with no line left out. `pyflakes` is clean, and the file
 compiles with `python -W error`.
 
@@ -361,8 +361,10 @@ unquoted value runs to the next space, and a comma, semicolon, bracket or ampers
 when a `name=` follows, so `token=abc&f=json` keeps its `f=json` and `pwd=Hun;ter2` leaves
 nothing of `ter2` behind. The line is blanked before anything is mined from it, so a secret
 cannot reach `metric_key` or `display_name` in those forms either. This is best effort. A secret
-with no name beside it cannot be found, and neither can one with a space and no `=` or `:` after
-its name (`password hunter2`). A value with a space in it that is not quoted ends at the space,
+with no name beside it cannot be found. A secret name followed by a space, a plural `s` or `=`
+is blanked when its value holds a letter and a digit or is quoted, so `password hunter2`,
+`Passwords: abc123` and `password 'VALUE'` are covered, while `password expired` and
+`Tokens: 1200` are left alone. A value with a space in it that is not quoted ends at the space,
 and the rest of it stays visible. A command line flag with a space before its value, such as
 `--password hunter2`, `--pass hunter2`, `--client-secret hunter2` or the PowerShell form
 `-Password hunter2`, is covered, and so is the same flag with a quoted value. A value that starts with a single dash,
@@ -376,7 +378,10 @@ count that follows such a header on the same line is lost. A JSON string held in
 writes `\"password\": \"...\"`, is covered. An ODBC value in braces, `PWD={my pass;word}`, is
 blanked whole. An AWS access key id (`AKIA` and 16 capitals or digits) is blanked by its shape
 with no name beside it. So is a GitHub token (`ghp_`, `gho_`, `ghu_`, `ghs_`, `ghr_` or
-`github_pat_` and 20 or more letters or digits). The sqlcmd flag `-P VALUE`, with an upper-case
+`github_pat_` and 20 or more letters or digits), an npm token (`npm_` and 30 or more), a Slack
+token (`xoxb-` and the other four letters) and the path of a Slack webhook URL. The names
+`subscription_key`, `session_id` and `cred` are on the list, and the value in
+`ConvertTo-SecureString "..."` is blanked. The sqlcmd flag `-P VALUE`, with an upper-case
 P, is blanked, and so are `pw=`, `pass=`, `Passcode:`, `PIN:`, `Bearer: VALUE`, a `Cookie:` or
 `Set-Cookie:` value and `AccountKey=`. The name list is fixed. `pat=`, a lower-case flag such as `-p VALUE` (which is a port to psql), a bare `code=`
 OAuth value, `bearer=VALUE` and a token with no name beside it are not recognised. A URL-encoded separator (`token%3Dabc`, `api_key%3Aabc`) and a `user:pass@host` with no scheme
@@ -495,8 +500,8 @@ logsift: 1 manual run(s) left out of the series
 
 The `>>` operator does not match the encoding of the file it appends to
 ([about_Character_Encoding](https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.core/about/about_character_encoding?view=powershell-5.1)).
-A UTF-8 log that a later `>>` extended in UTF-16LE is decoded by its start, so the appended
-half is not mined. That is a named limit below.
+A UTF-8 log that a later `>>` extended in UTF-16LE is decoded as UTF-8, because the file starts in
+UTF-8, so the appended half is not mined and the UTF-8 half is. That is a named limit below.
 
 ## Tail read
 
@@ -704,8 +709,9 @@ refusing the numbers that are not measurements, and noticing that two spellings 
   in 5.1 write a BOM-less cp1252 file instead (measured on 5.1.26100). The tool reads it as UTF-8: the
   numbers are mined, and a non-ASCII character in `sample_line` becomes U+FFFD.
 - An encoding is chosen once, from the start of the file. A UTF-8 log that a later `>>` extended
-  in UTF-16LE mines only its UTF-8 part. Microsoft documents that `>>` does not match the
-  encoding of its target.
+  in UTF-16LE mines only its UTF-8 part, however short that part is: a file with no BOM is read as
+  UTF-16 only when its first code unit holds the zero byte. Microsoft documents that `>>` does not
+  match the encoding of its target.
 - `--tail` and `--sections` cannot be combined, and a job total written after the last banner is
   keyed to that last section.
 - `--scheduled-at` uses the first timestamp in the log, in the log's own clock, and a run that
@@ -765,7 +771,8 @@ refusing the numbers that are not measurements, and noticing that two spellings 
   decoding logsift's UTF-8 bytes with the console code page, so a non-ASCII character can be
   garbled. It depends on the console output encoding: with the default code page on one test host
   a check mark and an arrow came through intact, and with the code page set to CP437 they did not.
-  Use `--out FILE --apply` to get UTF-8.
+  On a machine whose console code page is 437 the default also garbles. Use `--out FILE --apply`
+  to get UTF-8.
 - The csv guard is the six characters above and nothing more. OWASP also lists a line feed and the
   full-width forms of `=`, `+`, `-` and `@`. A cell cannot start with a line feed that came from a
   log line, because lines are split there. A log file name that starts with a line feed, or with a
@@ -801,9 +808,9 @@ refusing the numbers that are not measurements, and noticing that two spellings 
 - A sentence count keeps the words after the number in its key. A leading `of TOTAL` is cut off,
   so `Processed 500 of 10000 records` is `processed_record_count`, but another total in the words,
   such as `Updated 5 records out of 9000`, still changes the key.
-- A log file that is deleted between the folder listing and the modification time check is dropped
-  with no warning. Only a failure of the later read, or a deletion during the listing, is named on
-  stderr with exit 3.
+- A log file that is deleted between the folder listing and the modification time check is named
+  on stderr (`vanished during the listing; skipping it`) and the run exits 3, not 0. A deletion
+  after that check, during the read, is named the same way.
 - When `--scheduled-at` removes every row as a manual run, the message `no number in those logs
   survived the rules` names the wrong cause. Exit 1 is still right. Read the line `manual run(s)
   left out of the series` above it.
@@ -825,6 +832,11 @@ refusing the numbers that are not measurements, and noticing that two spellings 
 - Naming a csv file on the command line, for example `logsift metrics.csv`, mines it as ordinary
   log text and keeps no apostrophe strip. The tool does not parse its own csv back, but it will
   read one if you name it. The exclusion of `.csv` files applies only to a directory scan.
+- Timings in this README are from one workstation and vary with the disk and CPU.
+- The noise keys `cpp` and `s_features` were seen in real arcpy job logs and are not taken from
+  Esri documentation. A message of another shape is charted if it has a measuring word.
+- The comparison with Promtail, Datadog, Splunk, mtail and grok_exporter is from their public
+  documentation, not from running them.
 - The tail timing figures above (0.123 s for `--tail` and 78.4 s for a full read of a 163 MB
   UTF-16LE file) are machine dependent. An earlier measurement of a file of the same shape gave
   0.134 s and 29.2 s, so the full read time varies by a factor of two or more between runs and
@@ -857,13 +869,12 @@ refusing the numbers that are not measurements, and noticing that two spellings 
 - A secret in a call with no name beside it, such as `GIS(url, user, 'MyP@ssw0rd!')`, in
   `Using credentials user/pass123`, in `Token expired: VALUE` or in `password is VALUE`, stays
   visible in `sample_line` and can reach `metric_key`.
-- A secret written as plain words with no `=` or `:` after its name, such as `Using token VALUE`,
-  `Token acquired: VALUE`, `with password VALUE` or `Got token VALUE expires in 60 seconds`, stays
-  visible in `sample_line`.
-- A short or plural secret name is not on the fixed list: `cred=`, `tok=`, `pat=`,
-  `subscription_key=`, `tokens:`, `Passwords:` and the attached form
-  `-pVALUE` are not blanked. A camelCase name that ends in `Key`, such as `licenseKey=`,
-  `appKey=` or `subscriptionKey=`, is the same class. The flag forms `--pass VALUE` and
+- A secret written as plain words with no `=` or `:` after its name stays visible when its value
+  is all letters or all digits, as in `Using token hunter` or `with password 482913`. A value that
+  holds a letter and a digit, or is quoted, is blanked. `Token acquired: VALUE` stays visible.
+- A short secret name that is not on the fixed list, `tok=`, `pat=` and the attached form
+  `-pVALUE`, is not blanked. A camelCase name that ends in `Key`, such as `licenseKey=` or
+  `appKey=`, is the same class. The flag forms `--pass VALUE` and
   `--db-pass VALUE` are covered, but the plain words `Pass: VALUE` are not, and the value can
   reach `metric_key`, which the csv writes.
 - A URL whose user name holds an unencoded `@`, such as `smtp://john@corp.example:pw@mail.example`,
@@ -924,15 +935,17 @@ refusing the numbers that are not measurements, and noticing that two spellings 
 - Attached and slash flags are not blanked: `sqlcmd -PVALUE`, `7z -pVALUE`, `curl -u user:VALUE`,
   `--user user:VALUE`, `schtasks /rp VALUE` and `psql -W VALUE`. Only the spaced upper-case
   `-P VALUE` is blanked.
-- A session id (`session=`, `sessionid=`, `jsessionid=`) is not on the secret name list and is
-  printed, unless it sits inside a `Cookie:` or `Set-Cookie:` value.
+- A session id written as `session=` is not on the secret name list and is printed, unless it
+  sits inside a `Cookie:` or `Set-Cookie:` value. `sessionid=`, `session_id=` and `jsessionid=`
+  are blanked.
 - A password inside `scheme://user:pass@host` that holds a slash leaves the part after the slash
   visible (`amqp://u:SEC/RET@h` is unchanged), next to the documented `@` case. `pwd="abc"def`
   blanks the quoted part and leaves `def`.
-- Only `ghp_`, `gho_`, `ghu_`, `ghs_`, `ghr_`, `github_pat_` and `AKIA` tokens are found by shape.
-  Other vendor tokens with no name beside them (`npm_...`, `sk-...`, `xoxb-...`, a JWT, a webhook
-  URL path) print as they are. A bare `Bearer VALUE` with no `Authorization` header is blanked only
-  when VALUE is 8 or more characters from letters, digits and `. _ ~ + / = -`.
+- Only `ghp_`, `gho_`, `ghu_`, `ghs_`, `ghr_`, `github_pat_`, `npm_`, `xox` and `AKIA` tokens and
+  Slack webhook paths are found by shape. Other vendor tokens with no name beside them (`sk-...`,
+  a JWT, another webhook URL path) print as they are. A bare `Bearer VALUE` with no
+  `Authorization` header is blanked only when VALUE is 8 or more characters from letters, digits
+  and `. _ ~ + / = -`, or 4 or more that include a digit.
 - The csv guard tests only the first character, so a text cell that starts with a NUL or a U+FEFF
   before a sign is written unguarded, because `str.strip()` removes neither. Whether a spreadsheet
   runs such a cell was not tested.
@@ -943,9 +956,11 @@ refusing the numbers that are not measurements, and noticing that two spellings 
   `exported_records_to_2026_export`. A decimal timing (`in 7.5 seconds`) is cut from the key, and
   the duration it holds is not charted.
 - The csv quoting of a cell with a CR, an LF or a tab, and the guard on a tab or CR first
-  character, cannot be reached from the command line, because log lines are split on CR and LF and
-  stripped before a cell is built. The self-test reaches them through `render()` with synthetic
-  rows.
+  character, cannot be reached from a log line, because log lines are split on CR and LF and
+  stripped before a cell is built. A log file name that holds a line feed, possible on Linux, does
+  reach them through a folder scan (measured on Python 3.12 on Linux: the row is quoted across the
+  line feed and a leading `=` gets its apostrophe). The self-test reaches them through `render()`
+  with synthetic rows.
 - `user:pass@host` with no scheme is blanked by its shape, so the part before an `@` is also
   blanked in `mailto:bob@example.com`. The spaced forms `Password VALUE` and `-p VALUE` and a
   secret in the `user:pass` of `curl -u` stay visible.
@@ -986,7 +1001,9 @@ Behaviour this tool relies on, and where it was checked:
   and 3.12 and 3.13 quote it. This was measured on all four with the csv module, not read: with the whole-row quoting removed,
   the self-test fails on 3.9.25 and 3.10.20 and passes on 3.12 and 3.13.
 
-No Esri, SQL Server or Census behaviour is used.
+No Esri, SQL Server or Census behaviour is relied on for a verdict. The one exception is the noise
+list, which holds arcpy message shapes seen in real job logs and not taken from Esri documentation
+(see Limits).
 
 ## Contributing
 
