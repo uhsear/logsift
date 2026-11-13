@@ -210,7 +210,7 @@ VERB_VALUE_RE = re.compile(
 # _hash or Id.
 _SECRET_NAMES = (r"(?:token|password|passwd|passphrase|secret|credentials?|pwd|"
                  r"(?:api|private|access|signing|encryption|ssh|master|account|subscription)[_-]?key|"
-                 r"session[_-]?id|passcode|\bcred(?=\s*[=:])|\b(?:pass|pw)(?=\s*=)|\bpin(?=\s*[=:])|\b(?:auth|key|sig|signature))")
+                 r"session[_-]?id|passcode|\bcred(?=\s*[=:])|(?<![A-Za-z])(?:db|pg|sql|my|ora)?(?:pass|pw)(?=\s*=)|\bsession(?=\s*=)|\bpin(?=\s*[=:])|\b(?:auth|key|sig|signature))")
 # A quoted value may hold an escaped quote. A value in braces is the ODBC form
 # PWD={my;pass}. An escaped quote pair is a JSON string held inside a JSON
 # string, as a structured logger writes it. An unquoted value runs to the next
@@ -235,6 +235,15 @@ REDACTIONS = [
     (re.compile(r"(?i)\b(bearer:?\s+)(?:(?=[A-Za-z0-9._~+/=-]*\d)[A-Za-z0-9._~+/=-]{4,}|[A-Za-z0-9._~+/=-]{8,})"),
      r"\1REDACTED"),
     (re.compile(r"\bAKIA[0-9A-Z]{16}\b"), "REDACTED"),
+    (re.compile(r"\bsk-[A-Za-z0-9_-]{20,}"), "REDACTED"),
+    # curl -u user:pass and --user user:pass. A lower-case -u with no colon after it is a
+    # user name on its own and is left alone.
+    (re.compile(r"(?<!\S)(-u\s+|--user[=\s]\s*)(?:\"[^\"]*:[^\"]*\"|'[^']*:[^']*'|[^\s:\"']+:\S+)"),
+     r"\1REDACTED"),
+    # "Token expired: VALUE": one word sits between the name and the colon.
+    (re.compile(r"(?i)\b((?:token|password|passwd|passphrase|secret|pwd|passcode)s?\s+\w+\s*:\s*)"
+                r"(?:(?=\S*[A-Za-z])(?=\S*\d)[^\s&;,)\]]{4,}|(?:" + _QUOTED_VALUE + r"))"),
+     r"\1REDACTED"),
     (re.compile(r"\bnpm_[A-Za-z0-9]{30,}"), "REDACTED"),
     (re.compile(r"\bxox[abprs]-[A-Za-z0-9-]{10,}"), "REDACTED"),
     (re.compile(r"(?i)(hooks\.slack\.com/services/)[A-Za-z0-9/_-]+"), r"\1REDACTED"),
@@ -248,6 +257,9 @@ REDACTIONS = [
     (re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})"), "REDACTED"),
     # sqlcmd takes its password as an upper-case -P. The lower-case -p of psql is a port.
     (re.compile(r"(?<!\S)(-P\s+)(?:" + _QUOTED_VALUE + r"|(?!--[A-Za-z])\S+)"), r"\1REDACTED"),
+    # Attached, as -PValue. A value of letters only cannot be told from a PowerShell
+    # parameter such as -Path or -PassThru, so it is left alone.
+    (re.compile(r"(?<!\S)(-P)(?!-)(?:" + _QUOTED_VALUE + r"|(?=\S*[^A-Za-z\s])\S+)"), r"\1REDACTED"),
     (re.compile(r"(?i)(" + _SECRET_NAMES + _SECRET_SUFFIX + r"\\?[\"']?\s*(?:[=:]|%3[dDaA])\s*)"
                 r"(?:" + _QUOTED_VALUE + r"|" + _BARE_VALUE + r")"),
      r"\1REDACTED"),
@@ -269,13 +281,15 @@ ERROR_LEVEL_RE = re.compile(r"(?:^|[\s\[|])(?:ERROR|CRITICAL|FATAL)(?=$|[\s\]|:-
 # something it measured. A key ending in a singular "version" names one
 # software version, and the Start-Transcript header writes nine of them
 # ("PSVersion: 5.1.26100", "BuildVersion: 10.0...") that would chart as 5.1 and
-# 10. A plural count such as reconciled_versions is kept. The last pattern is a
-# build or commit id.
+# 10. A plural count such as reconciled_versions is kept. A singular "Error: 404
+# for parcel 12" carries an error code or a status, not a count: the plural
+# "Errors: 4" is the count and is kept. The last pattern is a build or commit id.
 NOISE_METRIC_KEY_PATTERNS = [
     re.compile(pattern, re.IGNORECASE)
     for pattern in [
         r"^start_time$", r"^time$", r"^finished$", r"^failed$", r"^runtimeerror$",
         r"^cpp$", r"^s_features$", r"^pass_\d+_complete$",
+        r"^(?:http_)?error(?:_code)?$",
         r"^.*batch_size$",
         r"^.*version$", r"^pscompatibleversions$",
         r"^[a-f0-9_]{16,}$",
@@ -804,14 +818,37 @@ def discover_log_directories(script_path, working_directory=None):
     return unique_directories(candidates)
 
 
+def _nested_logs(entries, cutoff, skip):
+    """The subfolders among `entries` that hold a .log file newer than `cutoff`.
+
+    Only the top level of a folder is mined, so a run in Logs/2026-09/ is not read.
+    A folder in `skip` is read in its own right, and a hidden folder or a
+    node_modules is not a log archive. A subfolder is searched to any depth, for
+    its first recent .log file. Only .log counts here, not .txt, because a
+    subfolder of notes is not a missing run.
+    """
+    found = []
+    for entry in entries:
+        if (not entry.is_dir() or entry.name.startswith(".") or entry.name == "node_modules"
+                or entry in skip):
+            continue
+        for walked, _, names in os.walk(str(entry)):
+            if any(name.lower().endswith(".log") and (_mtime(Path(walked, name)) or 0) >= cutoff
+                   for name in names):
+                found.append(entry)
+                break
+    return found
+
+
 def recent_log_files(directories, days_back=DEFAULT_DAYS_BACK, limit=DEFAULT_MAX_FILES,
-                     unlisted=None, dropped=None):
+                     unlisted=None, dropped=None, nested=None):
     """The newest log files across these directories, inside the day window.
 
     A directory that cannot be listed is warned about and appended to `unlisted`
     when the caller passes a list, so the caller can fail the run: its runs are
     missing from the series. A log that disappears during the listing, and every
     log that the `limit` cuts off, is appended to `dropped` for the same reason.
+    A subfolder that holds a recent .log file is appended to `nested`: it is not read.
     """
     cutoff = (_utc_now() - timedelta(days=days_back)).timestamp()
     found = []
@@ -823,6 +860,8 @@ def recent_log_files(directories, days_back=DEFAULT_DAYS_BACK, limit=DEFAULT_MAX
             if unlisted is not None:
                 unlisted.append(directory)
             continue
+        if nested is not None:
+            nested.extend(_nested_logs(entries, cutoff, directories))
         for path in entries:
             if not path.is_file() or path.suffix.lower() not in LOG_SUFFIXES:
                 continue
@@ -870,7 +909,7 @@ def scan_log_file(path, max_lines=DEFAULT_MAX_LINES, rules=(), tail=False, secti
     run is hours after it started.
     """
     metrics = {}
-    lines_scanned = error_lines = warning_lines = 0
+    lines_scanned = error_lines = warning_lines = garbled = 0
     truncated = False
 
     try:
@@ -878,7 +917,8 @@ def scan_log_file(path, max_lines=DEFAULT_MAX_LINES, rules=(), tail=False, secti
     except OSError as exc:
         _emit("WARNING: could not read %s: %s" % (path, exc))
         return {"metrics": {}, "lines_scanned": 0, "error_lines": 0, "warning_lines": 0,
-                "started": None, "encoding": None, "unreadable": True, "truncated": False}
+                "started": None, "encoding": None, "unreadable": True, "truncated": False,
+                "garbled": 0}
 
     with handle:
         sample = handle.read(SNIFF_BYTES)
@@ -893,6 +933,13 @@ def scan_log_file(path, max_lines=DEFAULT_MAX_LINES, rules=(), tail=False, secti
         section = None
         for raw_line in lines:
             line = raw_line.strip()
+            if width == 1 and "\x00" in line:
+                # A text log that a later ">>" extended in UTF-16 decodes as UTF-8 with a NUL
+                # between its letters. Nothing in such a line can be mined, so count it rather
+                # than let its metrics vanish and the run end clean. Pure NUL padding is blank.
+                if line.replace("\x00", "").strip():
+                    garbled += 1
+                continue
             if not line:
                 continue
             # A further line past the cap: the file was cut short, and a total the
@@ -927,7 +974,7 @@ def scan_log_file(path, max_lines=DEFAULT_MAX_LINES, rules=(), tail=False, secti
     return {"metrics": metrics, "lines_scanned": lines_scanned,
             "error_lines": error_lines, "warning_lines": warning_lines,
             "started": started, "encoding": codec, "unreadable": False,
-            "truncated": truncated}
+            "truncated": truncated, "garbled": garbled}
 
 
 def build_rows(paths, rules=(), max_lines=DEFAULT_MAX_LINES, tail=False, sections=False,
@@ -988,6 +1035,7 @@ def build_rows(paths, rules=(), max_lines=DEFAULT_MAX_LINES, tail=False, section
             "unclassified": unclassified,
             "truncated": scan["truncated"],
             "unreadable": scan["unreadable"],
+            "garbled": scan["garbled"],
         })
     rows.sort(key=lambda row: (row["metric_key"], row["observed_at_utc"], row["log_file"]))
     return rows, summaries
@@ -2269,6 +2317,85 @@ def self_test():
         rc, out, err = capture(lambda: main([sql_log, "--format", "csv"]))
         check(rc == 0 and "xyz987abc" not in out.lower() and "records_updated" in out,
               "a sqlcmd password never reaches metric_key or sample_line  <-- pinned defect")
+        # An underscore or a database prefix does not hide a short name, and a few more shapes.
+        for flag_line, secret in (("Connecting DB_PASS=Hunter22X Records updated: 5", "Hunter22X"),
+                                  ("Connecting db_pw=Hunter22X Records updated: 5", "Hunter22X"),
+                                  ("Connecting DBPASS=Hunter22X Records updated: 5", "Hunter22X"),
+                                  ("env PG_PASS=Hunter22X x 5 records", "Hunter22X"),
+                                  ("GET /x session=Hunter22X Records updated: 5", "Hunter22X"),
+                                  ("curl -u svc:Hunter22X https://h/x Records updated: 5", "Hunter22X"),
+                                  ('curl -u "svc:Hunter22X" https://h/x Records updated: 5', "Hunter22X"),
+                                  ("tool --user svc:Hunter22X Records updated: 5", "Hunter22X"),
+                                  ("tool --user=svc:Hunter22X Records updated: 5", "Hunter22X"),
+                                  ("sqlcmd -S h -U sa -PHunter22X Records updated: 5", "Hunter22X"),
+                                  ("sqlcmd -S h -U sa -P'two words' Records updated: 5", "two words"),
+                                  ("Token expired: Hunter22X Records updated: 5", "Hunter22X"),
+                                  ("Password invalid: 'Hunter 22' Records updated: 5", "Hunter 22"),
+                                  ("OPENAI sk-abcdefghijklmnopqrstuvwx Records updated: 5",
+                                   "sk-abcdefghijklmnopqrstuvwx")):
+            check(secret not in redact(flag_line) and "REDACTED" in redact(flag_line),
+                  "the secret in %r is blanked  <-- pinned defect" % flag_line[:26])
+        for prose in ("bypass=1 compass=5 Records updated: 5", "psql -U sa -p 5432 Records updated: 5",
+                      "run -Path C:/x -PassThru -Pattern y Records updated: 5",
+                      "ls -u svc --user svc Records updated: 5", "Token expired: 2026-03-04 5 records",
+                      "Token refresh: ok 5 records", "session 5 done"):
+            check(redact(prose) == prose, "%r is left alone" % prose[:26])
+        under_log = write(os.path.join(tmp, "leak", "under.log"),
+                          "2026-03-04 03:14:07 - INFO - Connecting DB_PASS=Hunter22X "
+                          "batch records updated: 5\n")
+        rc, out, err = capture(lambda: main([under_log, "--format", "csv"]))
+        check(rc == 0 and "hunter22x" not in (out + err).lower() and "updated" in out,
+              "an underscore-prefixed password never reaches the csv  <-- pinned defect")
+        # A UTF-8 log that a later ">>" extended in UTF-16LE: the appended lines hold NULs and
+        # mine nothing. The run says so and exits 3, where it used to exit 0 with rows missing.
+        mixed_log = os.path.join(tmp, "mix", "nightly.log")
+        write(mixed_log, "2026-03-04 03:14:07 - INFO - Records checked: 12\n")
+        with open(mixed_log, "ab") as handle:
+            handle.write("Records updated: 777\r\n\x00\x00\r\n".encode("utf-16-le"))
+        rc, out, err = capture(lambda: main([mixed_log, "--format", "csv"]))
+        check(rc == 3 and "checked_record_count" in out and "NUL bytes" in err
+              and "1 log file(s) hold lines with NUL" in err,
+              "a UTF-16 section appended to a UTF-8 log is reported, exit 3  <-- pinned defect")
+        pad_log = write(os.path.join(tmp, "mix", "padded.log"),
+                        "2026-03-04 03:14:07 - INFO - Records checked: 12\n\x00\x00\x00\n")
+        rc, out, err = capture(lambda: main([pad_log, "--format", "csv"]))
+        check(rc == 0 and "NUL bytes" not in err, "a line of NUL padding alone is blank, not a fault")
+        # Only the top level of a folder is mined. A subfolder with a recent .log is named, exit 3.
+        sub_top = os.path.join(tmp, "nest", "Logs")
+        write(os.path.join(sub_top, "top.log"), "Records checked: 5\n")
+        write(os.path.join(sub_top, "2026-09", "deep.log"), "Records checked: 999\n")
+        write(os.path.join(sub_top, "notes", "readme.txt"), "Records checked: 7\n")
+        write(os.path.join(sub_top, ".hidden", "x.log"), "Records checked: 8\n")
+        write(os.path.join(sub_top, "node_modules", "x.log"), "Records checked: 8\n")
+        os.makedirs(os.path.join(sub_top, "empty"))
+        rc, out, err = capture(lambda: main([sub_top, "--days", "36500", "--format", "csv"]))
+        check(rc == 3 and "checked_record_count" in out and "1 subfolder(s)" in err
+              and "2026-09" in err and "notes" not in err and "hidden" not in err
+              and "node_modules" not in err,
+              "a subfolder that holds a .log is named and the run exits 3, not 0  <-- pinned defect")
+        rc, out, err = capture(lambda: main([os.path.join(sub_top, "2026-09"), "--days", "36500",
+                                             "--format", "csv"]))
+        check(rc == 0 and "999" in out, "naming the subfolder reads its runs and clears the exit")
+        write(os.path.join(tmp, "nest2", "Logs", "2026-09", "only.log"), "Records checked: 5\n")
+        rc, out, err = capture(lambda: main([os.path.join(tmp, "nest2", "Logs"), "--days", "36500"]))
+        check(rc == 3 and "1 subfolder(s)" in err and "could not be listed" not in err,
+              "a folder with only a subfolder of logs exits 3, not 'no log file'  <-- pinned defect")
+        old_deep = write(os.path.join(tmp, "nest3", "Logs", "old", "a.log"), "Records checked: 5\n")
+        os.utime(old_deep, (1, 1))
+        write(os.path.join(tmp, "nest3", "Logs", "top.log"), "Records checked: 5\n")
+        rc, out, err = capture(lambda: main([os.path.join(tmp, "nest3", "Logs"), "--format", "csv"]))
+        check(rc == 0 and "subfolder" not in err, "an archive subfolder older than --days is not a missing run")
+        write(os.path.join(tmp, "nest4", "job.py"), "pass\n")
+        write(os.path.join(tmp, "nest4", "Logs", "a.log"), "Records checked: 5\n")
+        rc, out, err = capture(lambda: main(["--script", os.path.join(tmp, "nest4", "job.py"),
+                                             "--days", "36500", "--format", "csv"]))
+        check(rc == 0 and "subfolder" not in err,
+              "a Logs folder beside a script is read, not reported as an unread subfolder")
+        # --apply with no --out writes nothing and must not look like a write.
+        plain_log = write(os.path.join(tmp, "apply", "a.log"), "Records checked: 5\n")
+        rc, out, err = capture(lambda: main([plain_log, "--apply"]))
+        check(rc == 64 and out == "" and "no --out was given" in err,
+              "--apply with no --out exits 64 and prints no data  <-- pinned defect")
         # A number in scientific notation is read whole, not by its mantissa.
         check(mine_line("Feature count: 1.5e+06") == [("feature_count", 1500000.0)]
               and mine_line("Total records: 1.5E3") == [("total_records", 1500.0)]
@@ -2283,8 +2410,15 @@ def self_test():
               "'Processed N of TOTAL records' is one series, not one per total  <-- pinned defect")
         # An HTTP status is a code, not a count, when its reason phrase follows.
         check(mine_line("Error: 404 Not Found") == [] and mine_line("Warning: 503 Service Unavailable") == []
-              and mine_line("Error: 404") == [("error", 404.0)],
+              and mine_line("Error: 404") == [],
               "'Error: 404 Not Found' is a status, not an error count  <-- pinned defect")
+        # A singular "Error:" carries a code or a status, never a count. The plural is the count.
+        check(mine_line("Error: 404 for parcel 12") == [] and mine_line("Error: 500") == []
+              and mine_line("2026-03-04 03:14:07 - ERROR - Error: 500") == []
+              and mine_line("Error code: 12") == [] and mine_line("HTTP error: 503") == []
+              and mine_line("Errors: 4") == [("errors", 4.0)]
+              and canonicalize_metric_key("error", [(re.compile("^error$"), "my_error")]) == "my_error",
+              "a bare 'Error: 404' is not charted as an error count, 'Errors: 4' is  <-- pinned defect")
         # Authorization in a quoted dict or JSON key, a quoted value, or a scheme
         # the first rule did not list.
         for auth_line, secret in (
@@ -2683,6 +2817,12 @@ def main(argv=None):
     if args.slack < 0:
         _emit("error: --slack is a number of minutes, 0 or more")
         return 64
+    # --apply with no --out writes nothing and prints the table, which a scheduled
+    # task would read as a successful write.
+    if args.apply and not args.out:
+        _emit("error: --apply writes the --out file, and no --out was given. Nothing "
+              "would be written. Add --out FILE.")
+        return 64
     # A tail window starts part way through a section, so the lines above its
     # first banner would be keyed to no section and join the wrong series.
     if args.tail and args.sections:
@@ -2748,11 +2888,17 @@ def main(argv=None):
     # the instruction. The day window applies to what discovery found.
     unlisted = []
     dropped = []
+    nested = []
     files = named_files + recent_log_files(directories, args.days, args.max_files, unlisted,
-                                           dropped)
-    if not files and unlisted:
-        _emit("ERROR: %d folder(s) could not be listed, so their runs are missing. "
-              "Exit 3, not 1." % len(unlisted))
+                                           dropped, nested)
+    if nested:
+        _emit("ERROR: %d subfolder(s) hold log files that were not read, because only the "
+              "top level of a folder is mined: %s. Pass each one on the command line. "
+              "Exit 3, not 0 or 1." % (len(nested), ", ".join(str(entry) for entry in nested)))
+    if not files and (unlisted or nested):
+        if unlisted:
+            _emit("ERROR: %d folder(s) could not be listed, so their runs are missing. "
+                  "Exit 3, not 1." % len(unlisted))
         return 3
     if not files:
         _emit("no log file in the last %d day(s) under: %s"
@@ -2790,6 +2936,11 @@ def main(argv=None):
     if unlisted:
         _emit("ERROR: %d folder(s) could not be listed, so their runs are missing from "
               "the series. Exit 3, not 0 or 1." % len(unlisted))
+    garbled = sum(1 for summary in summaries if summary["garbled"])
+    if garbled:
+        _emit("ERROR: %d log file(s) hold lines with NUL bytes, as a UTF-16 section appended to a "
+              "UTF-8 log does. Those lines were not mined, so their metrics are missing. Convert "
+              "the log to one encoding. Exit 3, not 0." % garbled)
     unclassified = sum(1 for summary in summaries if summary["unclassified"])
     if unclassified:
         _emit("ERROR: %d log file(s) have no timestamp the tool reads at their start, so "
@@ -2804,7 +2955,7 @@ def main(argv=None):
               "during the scan), so their runs are missing from the series. Raise "
               "--max-files or narrow --days. Exit 3, not 0."
               % (len(dropped) + len(vanished), args.max_files))
-    if unreadable or unlisted or unclassified or truncated or dropped or vanished:
+    if unreadable or unlisted or garbled or nested or unclassified or truncated or dropped or vanished:
         return 3
     if not rows:
         _emit("no number in those logs survived the rules. Run with --rules to "

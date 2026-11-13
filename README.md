@@ -161,10 +161,19 @@ PASS  the value of the flag in '--password hunter2' is blanked  <-- pinned defec
 PASS  a flag value that starts with a dash is blanked in 'run.exe --password -Ab'  <-- pinned defect
 ...
 PASS  a sqlcmd password never reaches metric_key or sample_line  <-- pinned defect
+...
+PASS  the secret in 'Connecting DB_PASS=Hunter2' is blanked  <-- pinned defect
+PASS  an underscore-prefixed password never reaches the csv  <-- pinned defect
+PASS  a UTF-16 section appended to a UTF-8 log is reported, exit 3  <-- pinned defect
+...
+PASS  a subfolder that holds a .log is named and the run exits 3, not 0  <-- pinned defect
+PASS  a folder with only a subfolder of logs exits 3, not 'no log file'  <-- pinned defect
+PASS  --apply with no --out exits 64 and prints no data  <-- pinned defect
 PASS  scientific notation is read as the number it is  <-- pinned defect
 ...
 PASS  'Processed N of TOTAL records' is one series, not one per total  <-- pinned defect
 PASS  'Error: 404 Not Found' is a status, not an error count  <-- pinned defect
+PASS  a bare 'Error: 404' is not charted as an error count, 'Errors: 4' is  <-- pinned defect
 PASS  the credential in "headers={'Authorization': 'B" is blanked  <-- pinned defect
 ...
 PASS  the credential after an unlisted scheme in 'Records checked: 4 Authorization: ' is blanked  <-- pinned defect
@@ -196,7 +205,7 @@ PASS  a failed run's footer names the count and each failure
 PASS  a harness that missed a deliberate failure is named FATAL, not passed over  <-- pinned defect
 PASS  importing the file runs nothing: main() is defined, not called
 --------------------------------------------------------------------
-537 assertions, 0 failed
+568 assertions, 0 failed
 ```
 
 The block above is an excerpt of a real run; the `...` lines stand for omitted lines, and the
@@ -206,12 +215,12 @@ last line is the real footer.
 
 Python 3.9 or newer. Nothing to install, no `arcpy`, no third-party package, no network and no
 database. It runs on ArcGIS Pro's Python and on a plain `python3` equally. The self-test above
-runs 537 assertions on Windows with Python 3.13, 3.12, 3.10 and 3.9, and the same 537 on Linux
+runs 568 assertions on Windows with Python 3.13, 3.12, 3.10 and 3.9, and the same 568 on Linux
 with Python 3.9, 3.10, 3.12 and 3.13. One label differs by platform:
 `the Logs and LOGS are ONE directory where the filesystem folds case` on Windows reads `... are TWO
 directories where it does not` on Linux, because the test asserts what each filesystem does. The
 label differs; the count does not.
-Branch coverage of `logsift.py` is 100 percent (1318 statements, 316 branches), measured with
+Branch coverage of `logsift.py` is 100 percent (1387 statements, 342 branches), measured with
 `python -m coverage run --branch logsift.py --self-test`, with no line left out. `pyflakes` is clean, and the file
 compiles with `python -W error`.
 
@@ -383,7 +392,11 @@ token (`xoxb-` and the other four letters) and the path of a Slack webhook URL. 
 `subscription_key`, `session_id` and `cred` are on the list, and the value in
 `ConvertTo-SecureString "..."` is blanked. The sqlcmd flag `-P VALUE`, with an upper-case
 P, is blanked, and so are `pw=`, `pass=`, `Passcode:`, `PIN:`, `Bearer: VALUE`, a `Cookie:` or
-`Set-Cookie:` value and `AccountKey=`. The name list is fixed. `pat=`, a lower-case flag such as `-p VALUE` (which is a port to psql), a bare `code=`
+`Set-Cookie:` value and `AccountKey=`. An underscore or a database prefix does not hide a short
+name: `DB_PASS=`, `db_pw=`, `DBPASS=` and `PG_PASS=` are blanked, while `bypass=` and `compass=`
+are not. `session=`, `curl -u user:VALUE`, `--user user:VALUE`, the attached `sqlcmd -PVALUE`
+(when the value holds a digit or a symbol, or is quoted, so that `-Path` and `-PassThru` survive),
+`Token expired: VALUE` (one word between the name and the colon) and an `sk-` key are blanked too. The name list is fixed. `pat=`, a lower-case flag such as `-p VALUE` (which is a port to psql), a bare `code=`
 OAuth value, `bearer=VALUE` and a token with no name beside it are not recognised. A URL-encoded separator (`token%3Dabc`, `api_key%3Aabc`) and a `user:pass@host` with no scheme
 are blanked too; the second form also blanks the part before an `@` in `mailto:bob@example.com`. A banner under
 `--sections` is blanked the same way, before it names a section. The text of a key built from
@@ -501,7 +514,9 @@ logsift: 1 manual run(s) left out of the series
 The `>>` operator does not match the encoding of the file it appends to
 ([about_Character_Encoding](https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.core/about/about_character_encoding?view=powershell-5.1)).
 A UTF-8 log that a later `>>` extended in UTF-16LE is decoded as UTF-8, because the file starts in
-UTF-8, so the appended half is not mined and the UTF-8 half is. That is a named limit below.
+UTF-8, so the appended half is not mined and the UTF-8 half is. The appended lines hold a NUL byte
+between their letters, so the run counts them, names the files on stderr and exits 3, not 0.
+Lines of NUL padding alone are blank and are not counted.
 
 ## Tail read
 
@@ -632,7 +647,7 @@ because you named the key yourself. That is how `verification` above gets mined 
 
 0 metrics mined, 1 nothing to chart, 2 the write step failed, 3 the series is known to be
 incomplete or unclassified (a log file could not be opened, a folder could not be listed,
-`--max-lines` cut a log short, or `--scheduled-at` could not classify a log), 64 usage error. Every usage error exits 64, including one that
+`--max-lines` cut a log short, a log holds lines with NUL bytes, a subfolder holds logs that were not read, or `--scheduled-at` could not classify a log), 64 usage error. Every usage error exits 64, including one that
 the argument parser raises, such as an unknown flag or `--days x`.
 
 Exit 1 is the interesting one. It means the tool read log files and no number in them survived
@@ -653,6 +668,14 @@ only to the limit, a total written last was never read, and the run says so and 
 stamp the tool cannot read (no stamp, or one that is not ISO or `MM/DD/YYYY`, such as a time
 only `10:42:07 INFO ...`) cannot be told from a scheduled run, so it is kept, named on stderr, and
 the run exits 3. A US dated stamp (`08/11/2026 10:42:07`, with or without `AM` or `PM`) is read.
+
+Only the top level of a folder is read. A subfolder that holds a `.log` file modified inside the
+`--days` window, at any depth, is named on stderr and the run exits 3, also when the top level
+gave rows. Name the subfolder on the command line to read it. A hidden folder, `node_modules` and
+a subfolder of `.txt` notes are not reported, and neither is the `Logs` folder that `--script`
+already reads. A subfolder whose logs are all older than `--days` is not a missing run.
+
+`--apply` with no `--out` writes nothing, so it exits 64 and prints no data.
 
 A log file that is deleted between the listing and the read, or during the listing, is named on
 stderr and the run exits 3, because its run is missing from the series. The same exit follows when
@@ -701,7 +724,7 @@ refusing the numbers that are not measurements, and noticing that two spellings 
 - `--out` with `--apply` overwrites any file you name, including a log you are mining, so do not
   point it at your logs. Without `--apply` nothing is written, and the dry run says whether the
   file is already there. An empty `--out ""` counts as no `--out`: the data goes to stdout and
-  nothing is written. `--apply` with no `--out` writes nothing: it prints the table exactly as without `--apply`.
+  nothing is written. `--apply` with no `--out` is a usage error, exit 64.
 - A log with no BOM is sniffed from its zero bytes, which works for UTF-16 text that is mostly
   ASCII. UTF-16 text that is mostly non-Latin has few zero bytes, is read as UTF-8 and mines
   nothing. UTF-32 with no BOM is not detected and mines nothing. A PowerShell 5.1 log from `>` or
@@ -709,8 +732,9 @@ refusing the numbers that are not measurements, and noticing that two spellings 
   in 5.1 write a BOM-less cp1252 file instead (measured on 5.1.26100). The tool reads it as UTF-8: the
   numbers are mined, and a non-ASCII character in `sample_line` becomes U+FFFD.
 - An encoding is chosen once, from the start of the file. A UTF-8 log that a later `>>` extended
-  in UTF-16LE mines only its UTF-8 part, however short that part is: a file with no BOM is read as
-  UTF-16 only when its first code unit holds the zero byte. Microsoft documents that `>>` does not
+  in UTF-16LE mines only its UTF-8 part, however short that part is, and the run exits 3 with the
+  count of such files: a file with no BOM is read as UTF-16 only when its first code unit holds the
+  zero byte. The appended metrics are not recovered. Microsoft documents that `>>` does not
   match the encoding of its target.
 - `--tail` and `--sections` cannot be combined, and a job total written after the last banner is
   keyed to that last section.
@@ -797,10 +821,13 @@ refusing the numbers that are not measurements, and noticing that two spellings 
 - A closed pipe such as `| head -1` ends a large run with a `BrokenPipeError` traceback and exit
   1, the same code as `nothing to chart`, so exit 1 is ambiguous when the output goes through a
   pipe that can close. A small run (12 rows) exits 0.
-- A three-digit number from 100 to 599 followed by an HTTP reason phrase, such as `Error: 404 Not
-  Found`, is dropped as a status. A bare `Error: 404` is charted as the metric `error = 404`, and
-  so is a status followed by a word that is not on the short reason list. The tool refuses a
-  number that was never a measurement by label and a short phrase list, not by meaning.
+- A three-digit number from 100 to 599 followed by an HTTP reason phrase, such as `Warning: 503
+  Service Unavailable`, is dropped as a status. The singular labels `Error`, `Error code` and
+  `HTTP error` are dropped whatever the number, because `Error: 404 for parcel 12` carries a
+  code. The plural `Errors: 4` is a count and is charted. Another label that holds a status with
+  no reason phrase, such as `Failed: 500 for parcel 12`, is still charted. The tool refuses a
+  number that was never a measurement by label and a short phrase list, not by meaning, and a
+  `--rules` file can name `^error$` to chart it anyway.
 - `Elapsed: 00:01:07` and `Elapsed: 0:07:13` mine nothing, because `elapsed` alone is not in the
   list of duration labels. The labels read as durations are `duration`, `total duration`,
   `elapsed time`, `processing time`, `total execution time`, `total time` and `run time` (also
@@ -818,8 +845,6 @@ refusing the numbers that are not measurements, and noticing that two spellings 
   directory` with exit 64, not as exit 3, because the operating system answers the same way for
   both. A folder found through `--script` or `--working-directory`, or a named folder that is
   itself unreadable, exits 3.
-- `--apply` with no `--out` writes no file and says nothing. The data goes to stdout and the run
-  exits 0, so a scheduled task that forgets `--out` looks successful.
 - The table and the json are not guarded, by design. Only the csv is meant to be opened in a
   spreadsheet. A table pasted into a spreadsheet gets no protection.
 - With `--out FILE --apply`, an incomplete or empty result still overwrites the previous file. An
@@ -867,11 +892,11 @@ refusing the numbers that are not measurements, and noticing that two spellings 
 - A secret whose value holds a space, such as `PGPASSWORD=Hunter 2XYZ`, leaves the part after the
   space visible, and the word after it can reach `metric_key`.
 - A secret in a call with no name beside it, such as `GIS(url, user, 'MyP@ssw0rd!')`, in
-  `Using credentials user/pass123`, in `Token expired: VALUE` or in `password is VALUE`, stays
+  `Using credentials user/pass123`, in `Token expired: abc` (a value with no digit) or in `password is VALUE`, stays
   visible in `sample_line` and can reach `metric_key`.
 - A secret written as plain words with no `=` or `:` after its name stays visible when its value
   is all letters or all digits, as in `Using token hunter` or `with password 482913`. A value that
-  holds a letter and a digit, or is quoted, is blanked. `Token acquired: VALUE` stays visible.
+  holds a letter and a digit, or is quoted, is blanked. `Token acquired: VALUE` follows the same rule, with one word allowed before the colon.
 - A short secret name that is not on the fixed list, `tok=`, `pat=` and the attached form
   `-pVALUE`, is not blanked. A camelCase name that ends in `Key`, such as `licenseKey=` or
   `appKey=`, is the same class. The flag forms `--pass VALUE` and
@@ -911,8 +936,6 @@ refusing the numbers that are not measurements, and noticing that two spellings 
 - A log with no lines, only a BOM, or no number that survives the filters exits 1, the same code
   as `nothing to chart` and as a crash. A wrapper cannot tell a job that wrote an empty log from a
   tool crash.
-- `--apply` without `--out` writes nothing, prints the table and the summary line, and exits 0, so a scheduled
-  task with that mistake looks successful.
 - A number with 23 digits such as `Duration: 99999999999999999999999 s` is charted as `1e+23`, and
   `Rows: 1,2,3` is charted as 123. The tool does not question a value that parses.
 - A decimal comma, a dotted thousands separator and a space grouped thousands are misread:
@@ -925,25 +948,22 @@ refusing the numbers that are not measurements, and noticing that two spellings 
   line before it is cut to 240 characters.
 - `--out FILE --apply` opens the file for writing directly, so a write that fails part way, such as
   a full disk, truncates the previous good csv. The write is not atomic.
-- The claim that logsift runs on ArcGIS Pro's Python was exercised under the conda environment
-  `asirpro` (Python 3.11.8) and under a Pro installation's own `arcgispro-py3` (Python 3.13.7),
+- The claim that logsift runs on ArcGIS Pro's Python was exercised under a conda environment
+  cloned from Pro (Python 3.11.8) and under a Pro installation's own `arcgispro-py3` (Python 3.13.7),
   where the self-test passes with the same count.
-- A directory is read one level deep. Logs in a subfolder such as `Logs/2026-09/` are skipped with no
-  warning, and the run exits 0 when the top level holds other logs.
-- The PowerShell form `-Password (ConvertTo-SecureString "Secr3t" -AsPlainText -Force)` blanks only
-  the first word after the flag, so the quoted password inside the parentheses stays visible.
-- Attached and slash flags are not blanked: `sqlcmd -PVALUE`, `7z -pVALUE`, `curl -u user:VALUE`,
-  `--user user:VALUE`, `schtasks /rp VALUE` and `psql -W VALUE`. Only the spaced upper-case
-  `-P VALUE` is blanked.
-- A session id written as `session=` is not on the secret name list and is printed, unless it
-  sits inside a `Cookie:` or `Set-Cookie:` value. `sessionid=`, `session_id=` and `jsessionid=`
-  are blanked.
+- A directory is read one level deep. A subfolder such as `Logs/2026-09/` is not read: it is named
+  and the run exits 3. The subfolder search stops at the first recent `.log` file, and a subfolder
+  that holds only `.txt` files is not reported.
+- These flag forms are not blanked: `7z -pVALUE`, `schtasks /rp VALUE`, `psql -W VALUE`, an
+  attached `curl -uuser:VALUE`, and an attached `sqlcmd -PVALUE` whose value is letters only, since
+  that cannot be told from `-PassThru`.
 - A password inside `scheme://user:pass@host` that holds a slash leaves the part after the slash
   visible (`amqp://u:SEC/RET@h` is unchanged), next to the documented `@` case. `pwd="abc"def`
   blanks the quoted part and leaves `def`.
 - Only `ghp_`, `gho_`, `ghu_`, `ghs_`, `ghr_`, `github_pat_`, `npm_`, `xox` and `AKIA` tokens and
-  Slack webhook paths are found by shape. Other vendor tokens with no name beside them (`sk-...`,
-  a JWT, another webhook URL path) print as they are. A bare `Bearer VALUE` with no
+  Slack webhook paths are found by shape, and so are `sk-` keys of 20 or more characters. Other
+  vendor tokens with no name beside them (a JWT, a Microsoft Teams `webhook.office.com` path or
+  another webhook URL path) print as they are. A bare `Bearer VALUE` with no
   `Authorization` header is blanked only when VALUE is 8 or more characters from letters, digits
   and `. _ ~ + / = -`, or 4 or more that include a digit.
 - The csv guard tests only the first character, so a text cell that starts with a NUL or a U+FEFF
@@ -962,8 +982,26 @@ refusing the numbers that are not measurements, and noticing that two spellings 
   line feed and a leading `=` gets its apostrophe). The self-test reaches them through `render()`
   with synthetic rows.
 - `user:pass@host` with no scheme is blanked by its shape, so the part before an `@` is also
-  blanked in `mailto:bob@example.com`. The spaced forms `Password VALUE` and `-p VALUE` and a
-  secret in the `user:pass` of `curl -u` stay visible.
+  blanked in `mailto:bob@example.com`. The spaced form `-p VALUE` stays visible.
+- A csv that this tool wrote, mined as if it were a log (`python logsift.py out.csv`), has its
+  timestamps and file names partly blanked by the `user:pass@host` rule: `00:00,'@job.log` becomes
+  `00:REDACTED@job.log`. This is a false blank, not a leak.
+- Only `log_file` and `sample_line` can carry a formula character from real input, because
+  `metric_key` is cut down to `a-z`, `0-9` and `_`. The guard on `metric_key` and `display_name` is
+  defensive, and the self-test reaches it through `render()` with synthetic rows.
+- A secret that sits before a label on the same line, as in `token=abc123xyz Records updated: 5`,
+  is blanked, and the word `REDACTED` becomes part of the label. The count is charted as
+  `redacted_records_updated`, not `updated_record_count`, so that run drops out of the canonical
+  series.
+- Secret shapes with no `=` or `:` after the name are printed as they are: XML elements
+  (`<password>VALUE</password>`), a quoted key with a colon on `pass` (`'pass': 'VALUE'`),
+  `Using API key VALUE`, `ALTER USER x IDENTIFIED BY VALUE` and a name followed by a bracket
+  (`os.environ['PASSWORD'] = 'VALUE'`). So are a bracketed value under a plural key
+  (`"tokens": ["VALUE"]`) and a positional credential (`GIS(url, user, 'VALUE')`).
+- The error line count on stderr includes any line that starts with `error`, such as `ERRORS: 4`.
+  It is a summary only, and no exit code depends on it.
+- `--format json` ends with no newline, so on a terminal the stderr summary joins the closing
+  bracket. A redirected stdout is clean.
 
 ## Name
 
