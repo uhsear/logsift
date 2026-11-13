@@ -82,13 +82,13 @@ PASS  a utf-16le bom, as powershell 5.1 > and >> write, is found  <-- pinned def
 ...
 PASS  a utf-32le bom is not mistaken for the utf-16le bom it starts with  <-- pinned defect
 ...
-PASS  Logs, logs, Log and log resolve to one candidate  <-- pinned defect
+PASS  the Logs, logs, Log and log resolve to one candidate  <-- pinned defect
 ...
 PASS  an ancestor working directory is refused  <-- pinned defect
 PASS  so one shared log is not charted as every job's own  <-- pinned defect
 PASS  an ancestor spelled with a .. is refused too  <-- pinned defect
 PASS  an ancestor is refused even when the script's folder is not local  <-- pinned defect
-PASS  Logs and LOGS are ONE directory where the filesystem folds case  <-- pinned defect
+PASS  the Logs and LOGS are ONE directory where the filesystem folds case  <-- pinned defect
 ...
 PASS  one unlistable folder among good ones is exit 3, and the good rows still print  <-- pinned defect
 PASS  and an unlistable folder alone is exit 3, not 'nothing to chart'  <-- pinned defect
@@ -152,7 +152,7 @@ PASS  milliseconds are converted to seconds  <-- pinned defect
 ...
 PASS  'Total time: 1h 2m 3s' is 3723.0 seconds, the sum of its units  <-- pinned defect
 ...
-PASS  ERROR COUNT keeps its first word  <-- pinned defect
+PASS  the label ERROR COUNT keeps its first word  <-- pinned defect
 ...
 PASS  'DB_PASSWORD' is blanked  <-- pinned defect
 ...
@@ -177,7 +177,7 @@ PASS  the tail of 'config pwd=Hun;ter2XYZ R' is blanked too  <-- pinned defect
 PASS  the tail of 'SDE_PWD=Hunter3Real foun' is blanked too  <-- pinned defect
 ...
 PASS  a secret with a semicolon in it never reaches metric_key, display_name or sample_line  <-- pinned defect
-PASS  TOKX12 from csv never reaches metric_key or display_name  <-- pinned defect
+PASS  secret TOKX12 from csv never reaches metric_key or display_name  <-- pinned defect
 ...
 PASS  no mined row carries the token or the password  <-- pinned defect
 ...
@@ -196,7 +196,7 @@ PASS  a failed run's footer names the count and each failure
 PASS  a harness that missed a deliberate failure is named FATAL, not passed over  <-- pinned defect
 PASS  importing the file runs nothing: main() is defined, not called
 --------------------------------------------------------------------
-507 assertions, 0 failed
+517 assertions, 0 failed
 ```
 
 The block above is an excerpt of a real run; the `...` lines stand for omitted lines, and the
@@ -206,12 +206,12 @@ last line is the real footer.
 
 Python 3.9 or newer. Nothing to install, no `arcpy`, no third-party package, no network and no
 database. It runs on ArcGIS Pro's Python and on a plain `python3` equally. The self-test above
-runs 507 assertions on Windows with Python 3.13, 3.12, 3.10 and 3.9, and the same 507 on Linux
+runs 517 assertions on Windows with Python 3.13, 3.12, 3.10 and 3.9, and the same 517 on Linux
 with Python 3.9, 3.10, 3.12 and 3.13. One label differs by platform:
-`Logs and LOGS are ONE directory where the filesystem folds case` on Windows reads `... are TWO
+`the Logs and LOGS are ONE directory where the filesystem folds case` on Windows reads `... are TWO
 directories where it does not` on Linux, because the test asserts what each filesystem does. The
 label differs; the count does not.
-Branch coverage of `logsift.py` is 100 percent (1290 statements, 306 branches), measured with
+Branch coverage of `logsift.py` is 100 percent (1307 statements, 312 branches), measured with
 `python -m coverage run --branch logsift.py --self-test`, with no line left out. `pyflakes` is clean, and the file
 compiles with `python -W error`.
 
@@ -309,7 +309,7 @@ wrote 1835 byte(s) to metrics.csv
 |---|---|---|
 | `PATH` | none | Log files, or directories of them. A path that does not exist is a usage error. |
 | `--script` | none | A job's script. Its own folder, and any `Logs` folder beside it, are searched. |
-| `--working-directory` | none | The scheduled action's working directory, when it differs from the script's folder. |
+| `--working-directory` | none | The scheduled action's working directory, when it differs from the script's folder. A path that is not a directory is a usage error (exit 64). |
 | `--days` | `30` | Only log files modified in the last N days. |
 | `--max-files` | `40` | At most N log files, newest first. A log in the day window that the limit cuts off is counted on stderr and the run exits 3. A value below 1 is a usage error. |
 | `--max-lines` | `5000` | At most N lines per file. `0` reads the whole file. A file cut short by it is named on stderr. |
@@ -378,9 +378,9 @@ blanked whole. An AWS access key id (`AKIA` and 16 capitals or digits) is blanke
 with no name beside it. So is a GitHub token (`ghp_`, `gho_`, `ghu_`, `ghs_`, `ghr_` or
 `github_pat_` and 20 or more letters or digits). The sqlcmd flag `-P VALUE`, with an upper-case
 P, is blanked, and so are `pw=`, `pass=`, `Passcode:`, `PIN:`, `Bearer: VALUE`, a `Cookie:` or
-`Set-Cookie:` value and `AccountKey=`. The name list is fixed. `pat=`, a URL-encoded name such
-as `token%3Dabc`, a lower-case flag such as `-p VALUE` (which is a port to psql), a bare `code=`
-OAuth value, `bearer=VALUE` and a token with no name beside it are not recognised. A banner under
+`Set-Cookie:` value and `AccountKey=`. The name list is fixed. `pat=`, a lower-case flag such as `-p VALUE` (which is a port to psql), a bare `code=`
+OAuth value, `bearer=VALUE` and a token with no name beside it are not recognised. A URL-encoded separator (`token%3Dabc`, `api_key%3Aabc`) and a `user:pass@host` with no scheme
+are blanked too; the second form also blanks the part before an `@` in `mailto:bob@example.com`. A banner under
 `--sections` is blanked the same way, before it names a section. The text of a key built from
 words that sit before a number is the log's own text, so a secret written as plain words there is
 not covered.
@@ -412,8 +412,9 @@ updated_record_count,Updated Record Count,5,<time>,'@job.log,'-- Records updated
 
 The guard covers the file that `--out FILE --apply` writes, because both come from the same
 function. `--format json` and the table are not changed: neither one is opened in a spreadsheet.
-This tool never reads its own csv back. A program that reads it removes exactly one leading
-apostrophe from a text cell that starts with one.
+This tool does not read its own csv back, so no code here strips the apostrophe. A program that
+reads the file removes exactly one leading apostrophe from a text cell that starts with one. A csv
+named on the command line is mined as ordinary log text and keeps its apostrophes.
 
 A cell that holds a line break is a second risk. Python 3.9 and 3.10 do not quote a lone carriage
 return when the line terminator is LF, so a reader ends the row there and the rest of the cell
@@ -424,7 +425,8 @@ such a field by themselves. The self-test pins the behaviour on every Python it 
 
 ## Log encodings
 
-A log is never assumed to be UTF-8. The first 8 KiB decide the encoding. You never choose it.
+The first 8 KiB decide the encoding. You never choose it. A file with no BOM and no UTF-16 zero pattern
+is read as UTF-8 with undecodable bytes replaced, which is the last row of the table.
 
 | First bytes | Read as | Written by |
 |---|---|---|
@@ -434,7 +436,7 @@ A log is never assumed to be UTF-8. The first 8 KiB decide the encoding. You nev
 | `FF FE 00 00` | UTF-32LE, BOM skipped | rare. Tested before UTF-16LE, whose BOM it starts with. |
 | `00 00 FE FF` | UTF-32BE, BOM skipped | rare |
 | no BOM, a zero in about every other byte | UTF-16LE or UTF-16BE, by which half holds the zeros | a tool that wrote UTF-16 and left out the BOM |
-| anything else | UTF-8, undecodable bytes replaced | PowerShell 7, which writes UTF-8 without a BOM, and plain ASCII |
+| anything else | UTF-8, undecodable bytes replaced | PowerShell 7, which writes UTF-8 without a BOM, plain ASCII, and a cp1252 file such as `Set-Content` and `Add-Content` write in Windows PowerShell 5.1 |
 
 Zeros in both halves of the sample are a file padded with NUL bytes, and are not read as UTF-16.
 
@@ -506,16 +508,18 @@ line can mine half a number. The start time used by `--scheduled-at` is always r
 of the file. Lines above the window are never read and are not reported, so a metric written only
 near the top of a long log is absent and the run still exits 0. That is the choice `--tail` makes.
 
-Measured on a 163 MB UTF-16LE log of 1,500,000 lines, on the same Windows machine:
+Measured on a 163 MB UTF-16LE log of 1,500,000 lines, on one Windows machine. The file was one BOM
+plus the line `2026-03-04 03:14:07 - INFO - Records updated: N` for N from 0 to 1499999, each
+encoded as UTF-16LE with a CRLF ending:
 
 ```
 $ time python logsift.py big16.log --tail --max-lines 5
-real    0m0.134s
+real    0m0.123s
 $ time python logsift.py big16.log --max-lines 0
-real    0m29.188s
+real    1m18.372s
 ```
 
-Both mined `updated_record_count` 1500000. Error and warning line counts cover only the lines
+Both mined `updated_record_count` 1499999. Error and warning line counts cover only the lines
 that were read.
 
 ## Sections
@@ -692,11 +696,13 @@ refusing the numbers that are not measurements, and noticing that two spellings 
 - `--out` with `--apply` overwrites any file you name, including a log you are mining, so do not
   point it at your logs. Without `--apply` nothing is written, and the dry run says whether the
   file is already there. An empty `--out ""` counts as no `--out`: the data goes to stdout and
-  nothing is written. `--apply` with no `--out` does nothing and says nothing.
+  nothing is written. `--apply` with no `--out` writes nothing: it prints the table exactly as without `--apply`.
 - A log with no BOM is sniffed from its zero bytes, which works for UTF-16 text that is mostly
   ASCII. UTF-16 text that is mostly non-Latin has few zero bytes, is read as UTF-8 and mines
-  nothing. UTF-32 with no BOM is not detected and mines nothing. A real PowerShell 5.1 log always
-  has its BOM, so this has not met a real file.
+  nothing. UTF-32 with no BOM is not detected and mines nothing. A PowerShell 5.1 log from `>` or
+  `Start-Transcript` has its BOM, so this has not met a real file. `Set-Content` and `Add-Content`
+  in 5.1 write a BOM-less cp1252 file instead (measured on 5.1.26100). The tool reads it as UTF-8: the
+  numbers are mined, and a non-ASCII character in `sample_line` becomes U+FFFD.
 - An encoding is chosen once, from the start of the file. A UTF-8 log that a later `>>` extended
   in UTF-16LE mines only its UTF-8 part. Microsoft documents that `>>` does not match the
   encoding of its target.
@@ -749,8 +755,8 @@ refusing the numbers that are not measurements, and noticing that two spellings 
   and `is not a file, but its folder exists`, because that folder's logs would be charted as
   this job's. A bare name such as `--script nightly.py` has `.` as its folder, which always
   exists, so it is refused when the file is absent. Give a path with a folder, or use
-  `--working-directory`. The message `pass a log file or a directory of them, or --script` and
-  exit 64 appear when neither a path nor a script folder exists.
+  `--working-directory`. When neither a path nor a script folder exists, exit 64 names the script
+  (`no log folder found for --script`) or, with no `--script`, asks for a log file or a directory.
 - A line is read whole. One line of 30 MB with no newline took 78 seconds, because the line limit
   counts lines, not bytes.
 - The data is written to stdout in one call, so a closed pipe such as `| head -1` ends a large
@@ -819,9 +825,10 @@ refusing the numbers that are not measurements, and noticing that two spellings 
 - Naming a csv file on the command line, for example `logsift metrics.csv`, mines it as ordinary
   log text and keeps no apostrophe strip. The tool does not parse its own csv back, but it will
   read one if you name it. The exclusion of `.csv` files applies only to a directory scan.
-- The tail timing figures above (0.134 s for `--tail` and 29.188 s for a full read of a 163 MB
-  UTF-16LE file) are machine dependent. A second measurement on the same machine gave 0.115 s and
-  52.6 s, so the full read can take much longer than the figure quoted.
+- The tail timing figures above (0.123 s for `--tail` and 78.4 s for a full read of a 163 MB
+  UTF-16LE file) are machine dependent. An earlier measurement of a file of the same shape gave
+  0.134 s and 29.2 s, so the full read time varies by a factor of two or more between runs and
+  machines.
 - The list of same-named repositories in the Name section depends on a GitHub search made on
   2026-11-11. A quick second search found the same kinds of projects, but the list will drift.
 - Promtail, Datadog and Splunk are named in the comparison with no source link, so that
@@ -910,6 +917,38 @@ refusing the numbers that are not measurements, and noticing that two spellings 
 - The claim that logsift runs on ArcGIS Pro's Python was exercised under the conda environment
   `asirpro` (Python 3.11.8) and under a Pro installation's own `arcgispro-py3` (Python 3.13.7),
   where the self-test passes with the same count.
+- A directory is read one level deep. Logs in a subfolder such as `Logs/2026-09/` are skipped with no
+  warning, and the run exits 0 when the top level holds other logs.
+- The PowerShell form `-Password (ConvertTo-SecureString "Secr3t" -AsPlainText -Force)` blanks only
+  the first word after the flag, so the quoted password inside the parentheses stays visible.
+- Attached and slash flags are not blanked: `sqlcmd -PVALUE`, `7z -pVALUE`, `curl -u user:VALUE`,
+  `--user user:VALUE`, `schtasks /rp VALUE` and `psql -W VALUE`. Only the spaced upper-case
+  `-P VALUE` is blanked.
+- A session id (`session=`, `sessionid=`, `jsessionid=`) is not on the secret name list and is
+  printed, unless it sits inside a `Cookie:` or `Set-Cookie:` value.
+- A password inside `scheme://user:pass@host` that holds a slash leaves the part after the slash
+  visible (`amqp://u:SEC/RET@h` is unchanged), next to the documented `@` case. `pwd="abc"def`
+  blanks the quoted part and leaves `def`.
+- Only `ghp_`, `gho_`, `ghu_`, `ghs_`, `ghr_`, `github_pat_` and `AKIA` tokens are found by shape.
+  Other vendor tokens with no name beside them (`npm_...`, `sk-...`, `xoxb-...`, a JWT, a webhook
+  URL path) print as they are. A bare `Bearer VALUE` with no `Authorization` header is blanked only
+  when VALUE is 8 or more characters from letters, digits and `. _ ~ + / = -`.
+- The csv guard tests only the first character, so a text cell that starts with a NUL or a U+FEFF
+  before a sign is written unguarded, because `str.strip()` removes neither. Whether a spreadsheet
+  runs such a cell was not tested.
+- Credential-shaped words that are really measurements are blanked, so the count is lost: `Key: 5`,
+  `Pin: 12`, `Credentials: 3` and `pass=2`. This is a false positive, not a leak.
+- Digits from another number in a label split its series. `Updated 1432 records in 2 batches` is
+  cut to `updated_record_count`, but `Exported 40 records to 2026_export.csv` keys as
+  `exported_records_to_2026_export`. A decimal timing (`in 7.5 seconds`) is cut from the key, and
+  the duration it holds is not charted.
+- The csv quoting of a cell with a CR, an LF or a tab, and the guard on a tab or CR first
+  character, cannot be reached from the command line, because log lines are split on CR and LF and
+  stripped before a cell is built. The self-test reaches them through `render()` with synthetic
+  rows.
+- `user:pass@host` with no scheme is blanked by its shape, so the part before an `@` is also
+  blanked in `mailto:bob@example.com`. The spaced forms `Password VALUE` and `-p VALUE` and a
+  secret in the `user:pass` of `curl -u` stay visible.
 
 ## Name
 

@@ -235,12 +235,14 @@ REDACTIONS = [
     (re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})"), "REDACTED"),
     # sqlcmd takes its password as an upper-case -P. The lower-case -p of psql is a port.
     (re.compile(r"(?<!\S)(-P\s+)(?:" + _QUOTED_VALUE + r"|(?!--[A-Za-z])\S+)"), r"\1REDACTED"),
-    (re.compile(r"(?i)(" + _SECRET_NAMES + _SECRET_SUFFIX + r"\\?[\"']?\s*[=:]\s*)"
+    (re.compile(r"(?i)(" + _SECRET_NAMES + _SECRET_SUFFIX + r"\\?[\"']?\s*(?:[=:]|%3[dDaA])\s*)"
                 r"(?:" + _QUOTED_VALUE + r"|" + _BARE_VALUE + r")"),
      r"\1REDACTED"),
     (re.compile(r"(?i)(?<!\S)(--?[a-z0-9_-]*?(?:" + _SECRET_NAMES + r"|(?<=[-_])(?:pass|pw))" + _SECRET_SUFFIX + r"\s+)"
                 r"(?:" + _QUOTED_VALUE + r"|(?!--[A-Za-z])\S+)"), r"\1REDACTED"),
     (re.compile(r"(?i)\b([a-z][a-z0-9+.-]*://)[^/\s:@]*:[^/\s@]+@"), r"\1REDACTED@"),
+    # user:pass@host with no scheme, as a connection string or an ssh target writes it.
+    (re.compile(r"(?<![\w/.@:-])([A-Za-z0-9_.-]+:)[^\s:/@]+(?=@[A-Za-z0-9])"), r"\1REDACTED"),
 ]
 
 # An error line: the log level ERROR, CRITICAL or FATAL as its own token, in any
@@ -436,8 +438,12 @@ def normalize_metric_key(label):
 
 # "Processed 1432 records in 7 seconds" captures the timing as part of the label.
 # The timing differs every run, so the key would mint a new series every run.
+# A decimal timing ("in 7.5 seconds") reaches here as "in_7_5_seconds", or as
+# "in_7" when the label matcher stopped at the point. A count of batches or
+# passes changes every run the same way.
 _TRAILING_TIMING_RE = re.compile(
-    r"_in_\d+_(?:ms|milliseconds?|s|secs?|seconds?|mins?|minutes?|h|hours?)$")
+    r"_in_\d+(?:_\d+)?(?:_(?:ms|milliseconds?|s|secs?|seconds?|mins?|minutes?|h|hours?|"
+    r"batch(?:es)?|pass(?:es)?|chunks?))?$")
 
 
 def canonicalize_metric_key(metric_key, rules=()):
@@ -1441,7 +1447,7 @@ def self_test():
         check(any(path.name == "Logs" for path in found),
               "the Logs folder beside the script is found")
         check(len([path for path in found if path.name.lower() == "logs"]) == 1,
-              "Logs, logs, Log and log resolve to one candidate  <-- pinned defect")
+              "the Logs, logs, Log and log resolve to one candidate  <-- pinned defect")
         check(len(found) == 2, "the script's own folder is searched as well")
         check(discover_log_directories(os.path.join(tmp, "nowhere", "x.py")) == [],
               "a script path that is not on this machine finds nothing")
@@ -1499,9 +1505,9 @@ def self_test():
         # run the same line and report the same count.
         folds = os.path.normcase("A") == "a"
         check(len(folded) == (1 if folds else 2),
-              "Logs and LOGS are ONE directory where the filesystem folds case  <-- pinned defect"
+              "the Logs and LOGS are ONE directory where the filesystem folds case  <-- pinned defect"
               if folds else
-              "Logs and LOGS are TWO directories where it does not  <-- pinned defect")
+              "the Logs and LOGS are TWO directories where it does not  <-- pinned defect")
         check(len(unique_directories([Path(project), Path(project) / "." ,
                                       Path(project) / "Logs" / ".."])) == 1,
               "three spellings of one directory are scanned once")
@@ -1959,6 +1965,13 @@ def self_test():
         rc, out, err = capture(lambda: main(["--script", os.path.join(tmp, "nowhere", "x.py"),
                                              "--working-directory", sidecar]))
         check(rc == 0 and "55" in out, "--working-directory mines the sidecar logs")
+        rc, out, err = capture(lambda: main(["--script", script, "--working-directory",
+                                             os.path.join(tmp, "typo-dir")]))
+        check(rc == 64 and "--working-directory" in err and "not a directory" in err and not out,
+              "a mistyped --working-directory is exit 64, not a silent half run  <-- pinned defect")
+        rc, out, err = capture(lambda: main(["--script", os.path.join(tmp, "nowhere", "x.py")]))
+        check(rc == 64 and "nowhere" in err,
+              "a --script with no folder names the script it could not find")
         typo = os.path.join(os.path.dirname(script), "nope.py")
         rc, out, err = capture(lambda: main(["--script", typo]))
         check(rc == 64 and "is not a file, but its folder exists" in err,
@@ -2117,11 +2130,11 @@ def self_test():
 
         # A level word is stripped only when it is a level.
         check(mine_line("ERROR COUNT: 3") == [("error_count", 3.0)],
-              "ERROR COUNT keeps its first word  <-- pinned defect")
+              "the label ERROR COUNT keeps its first word  <-- pinned defect")
         check(mine_line("WARNING count: 2") == [("warning_count", 2.0)],
-              "WARNING count keeps its first word, so it is not the series 'count'  <-- pinned defect")
+              "the label WARNING count keeps its first word, so it is not the series 'count'  <-- pinned defect")
         check(mine_line("ERRORS: 4") == [("errors", 4.0)],
-              "ERRORS is a label, not the level ERROR and an S  <-- pinned defect")
+              "the label ERRORS is a label, not the level ERROR and an S  <-- pinned defect")
         check(mine_line("[INFO] Records updated: 3") == [("updated_record_count", 3.0)],
               "a bracketed level is still preamble")
         for level in ("INFO", "ERROR"):
@@ -2267,11 +2280,28 @@ def self_test():
         check(mine_line(redact("connect with --pass hunter2 then Records updated: 5"))
               == [("connect_with_pass_redacted_then_records_updated", 5.0)],
               "the password never reaches metric_key  <-- pinned defect")
+        check("SECRETPCT18" not in redact("Records updated: 18 token%3DSECRETPCT18")
+              and "SECRETPCT19" not in redact("Records updated: 19 api_key%3ASECRETPCT19&f=json")
+              and "&f=json" in redact("Records updated: 19 api_key%3ASECRETPCT19&f=json"),
+              "a url-encoded separator (%3D, %3A) does not hide a secret  <-- pinned defect")
+        check("SECRETUP17" not in redact("Records updated: 5 user:SECRETUP17@host")
+              and "SECRETUP18" not in redact("ssh admin:SECRETUP18@10.0.0.1 found 5")
+              and "SECRETUP19" not in redact("postgres://u:SECRETUP19@h/db found 5"),
+              "user:pass@host with no scheme is blanked  <-- pinned defect")
+        check(redact("at 03:14:07@host and Contact: bob@example.com") == "at 03:14:07@host and Contact: bob@example.com",
+              "a clock or a spaced address is left alone")
         # A timing at the end of the label is not part of the series name.
         for timing_line in ("Processed 1432 records in 7 seconds", "Processed 1433 records in 8 seconds",
                             "Processed 1434 records in 3 minutes", "Processed 1435 records in 12 s"):
             check([key for key, _ in mine_line(timing_line)] == ["processed_record_count"],
                   "%r charts as one series  <-- pinned defect" % timing_line[:34])
+        for timing_line in ("Processed 1432 records in 7.5 seconds", "Processed 1432 records in 8.25 s",
+                            "Processed 1432 records in 2 batches", "Processed 1432 records in 3 passes"):
+            check([key for key, _ in mine_line(timing_line)] == ["processed_record_count"],
+                  "%r charts as one series, decimal timing included  <-- pinned defect" % timing_line[:34])
+        check([key for key, _ in mine_line("Processed 1234 parcels in 12.5 seconds")]
+              == ["processed_parcels"],
+              "a decimal timing after a non-synonym noun is cut too  <-- pinned defect")
         # A JSON string inside a JSON string escapes its quotes.
         check("S3cr3tVALUE9z" not in redact(r'{"msg": "{\"password\": \"S3cr3tVALUE9z\"}", "n": 5}')
               and "S3cr3tVALUE9z" not in redact(r'{"msg": "{\"token\": \"two S3cr3tVALUE9z\"}"}'),
@@ -2322,7 +2352,7 @@ def self_test():
             for output_format in ("csv", "json", "table"):
                 rc, out, err = capture(lambda: main([leak_log, "--format", output_format]))
                 check(rc == 0 and secret.lower() not in out.lower() and "checked" in out.lower(),
-                      "%s from %s never reaches metric_key or display_name  <-- pinned defect"
+                      "secret %s from %s never reaches metric_key or display_name  <-- pinned defect"
                       % (secret[:6], output_format))
         secret_log = write(os.path.join(tmp, "secret", "run.log"),
                            "2026-03-04 03:14:07 - INFO - GET https://h/q?token=AAAA1234&f=json found 500 features\n"
@@ -2584,7 +2614,8 @@ def _parse(argv):
     parser.add_argument("--format", choices=FORMATS, default="table",
                         help="table, csv or json (default table)")
     parser.add_argument("--out", metavar="FILE",
-                        help="write the rendering here instead of stdout. Needs --apply.")
+                        help="with --apply, write the rendering here instead of stdout. "
+                             "Without --apply nothing is written.")
     parser.add_argument("--apply", action="store_true",
                         help="write the --out file. Without this nothing is written.")
     parser.add_argument("--self-test", dest="self_test", action="store_true",
@@ -2642,6 +2673,14 @@ def main(argv=None):
               "spelling: that folder's logs would be charted as this job's." % script_text)
         return 64
 
+    # A working directory that is not there is a typo. Dropping it silently would
+    # chart only the script folder's logs and say nothing about the rest.
+    working_text = _clean_text(args.working_directory)
+    if working_text and not os.path.isdir(working_text):
+        _emit("error: --working-directory %s is not a directory. Check the spelling: "
+              "its logs would be missing from this run." % working_text)
+        return 64
+
     named_files = [Path(path) for path in args.paths if os.path.isfile(path)]
     directories = [Path(path) for path in args.paths if os.path.isdir(path)]
     if args.script or args.working_directory:
@@ -2649,6 +2688,10 @@ def main(argv=None):
     directories = unique_directories(directories)
 
     if not directories and not named_files:
+        if args.script:
+            _emit("error: no log folder found for --script %s. Check the spelling, or "
+                  "pass a log file or a directory of them." % _clean_text(args.script))
+            return 64
         _emit("error: pass a log file or a directory of them, or --script. "
               "Use --self-test to check the tool without any logs.")
         return 64
